@@ -1,0 +1,7 @@
+Flask==3.0.3
+Flask-Cors==4.0.1
+psycopg2-binary==2.9.9
+requests==2.32.3
+gunicorn==22.0.0
+Werkzeug==3.0.3
+stripe==10.12.0
