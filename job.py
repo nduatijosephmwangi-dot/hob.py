@@ -2,7 +2,7 @@
 =====================================================================
  Wambui Shadrack Advocates — Legal Portal Backend (Single-File App)
  Flask + PostgreSQL + M-Pesa Daraja STK Push + Stripe Card Payments
- Integrated with Live Africa's Talking OTP Delivery
+ Integrated with Live Africa's Talking OTP Delivery for Staff
 =====================================================================
 """
 
@@ -18,7 +18,6 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
 
 import stripe
 import africastalking
@@ -28,7 +27,6 @@ import africastalking
 # =========================================================
 app = Flask(__name__)
 
-# Security Handshake: Force API to explicitly trust your live frontend domain
 frontend_url = os.environ.get("FRONTEND_URL", "*")
 CORS(app, resources={r"/api/*": {"origins": frontend_url}})
 
@@ -39,33 +37,88 @@ app.config['DATABASE_URL'] = os.environ.get(
 app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', './client_docs/')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Direct logs to stdout in production for dashboard monitoring streams
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s'
-)
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s: %(message)s')
 
-# Active Cyber-Killswitch System State
 SYSTEM_STATE = {"LOCKDOWN_MODE": False}
 
 # =========================================================
-# 📱 LIVE SMS GATEWAY (AFRICA'S TALKING)
+# 📱 LIVE SMS GATEWAY (AFRICA'S TALKING - STAFF ONLY)
 # =========================================================
 AT_USERNAME = os.environ.get("AT_USERNAME", "sandbox")
 AT_API_KEY = os.environ.get("AT_API_KEY", "")
-AT_SENDER_ID = os.environ.get("AT_SENDER_ID", None)  # Set to your Alphanumeric/Shortcode if approved
+AT_SENDER_ID = os.environ.get("AT_SENDER_ID", "").strip() or None
 
+sms_gateway = None
 try:
     if AT_API_KEY:
         africastalking.initialize(AT_USERNAME, AT_API_KEY)
         sms_gateway = africastalking.SMS
-        logging.info("✨ Africa's Talking Production Engine Initialized.")
+        logging.info(f"✨ Africa's Talking initialized (user={AT_USERNAME}, sender_id={AT_SENDER_ID or 'DEFAULT'})")
     else:
-        sms_gateway = None
-        logging.warning("⚠️ AT_API_KEY missing. SMS system operating in STUB/MOCK mode.")
+        logging.warning("⚠️ AT_API_KEY missing. SMS in STUB mode.")
 except Exception as e:
-    sms_gateway = None
     logging.error(f"Critical failure initializing Africa's Talking SDK: {e}")
+
+
+def _normalize_phone(phone: str) -> str:
+    """Return raw E.164 digits without '+', e.g. '254712345678'."""
+    p = str(phone or '').strip().replace(' ', '').replace('-', '').replace('+', '')
+    if p.startswith('0') and len(p) == 10:
+        p = '254' + p[1:]
+    elif p.startswith('7') and len(p) == 9:
+        p = '254' + p
+    return p
+
+
+def send_live_otp_sms(phone: str, otp_code: str):
+    """Dispatch OTP via Africa's Talking. Returns (ok: bool, info: str)."""
+    normalized = _normalize_phone(phone)
+    e164 = f"+{normalized}"
+    message = (f"Your Wambui Shadrack Advocates portal verification code is: "
+               f"{otp_code}. It expires in 10 minutes.")
+
+    if not sms_gateway:
+        logging.warning(f"🚨 STUB SMS to {e164}: {message}")
+        return False, "SMS gateway not configured (missing AT_API_KEY)."
+
+    def _try_send(sender):
+        if sender:
+            return sms_gateway.send(message, [e164], sender_id=sender)
+        return sms_gateway.send(message, [e164])
+
+    try:
+        response = _try_send(AT_SENDER_ID)
+        logging.info(f"📡 AT response for {e164}: {response}")
+
+        recipients = (response or {}).get('SMSMessageData', {}).get('Recipients', [])
+        if not recipients:
+            return False, f"AT returned no recipients: {response}"
+
+        r = recipients[0]
+        status = r.get('status', '')
+        status_code = r.get('statusCode')
+
+        if status_code in (100, 101, 102) or status.lower() == 'success':
+            return True, f"Delivered to gateway: {status}"
+
+        if AT_SENDER_ID and ('SenderId' in status or status_code == 406):
+            logging.warning(f"Retrying without sender_id (was '{AT_SENDER_ID}')")
+            response2 = _try_send(None)
+            logging.info(f"📡 AT retry response for {e164}: {response2}")
+            r2 = (response2 or {}).get('SMSMessageData', {}).get('Recipients', [{}])[0]
+            s2 = r2.get('status', '')
+            sc2 = r2.get('statusCode')
+            if sc2 in (100, 101, 102) or s2.lower() == 'success':
+                return True, f"Delivered (default sender): {s2}"
+            return False, f"AT rejected: {s2} (code {sc2})"
+
+        return False, f"AT rejected: {status} (code {status_code})"
+
+    except Exception as e:
+        logging.error(f"❌ AT SDK exception sending to {e164}: {e}")
+        return False, f"SDK exception: {e}"
+
 
 # =========================================================
 # 💰 M-PESA DARAJA (LIVE STK PUSH)
@@ -77,41 +130,7 @@ MPESA_SHORTCODE = os.environ.get('MPESA_SHORTCODE', '4747331')
 MPESA_PASSKEY = os.environ.get('MPESA_PASSKEY', '')
 MPESA_CALLBACK_URL = os.environ.get('MPESA_CALLBACK_URL', '')
 MPESA_TRANSACTION_TYPE = os.environ.get('MPESA_TRANSACTION_TYPE', 'CustomerPayBillOnline')
-
 MPESA_BASE = 'https://api.safaricom.co.ke' if MPESA_ENV == 'production' else 'https://sandbox.safaricom.co.ke'
-
-
-def _normalize_phone(phone: str) -> str:
-    p = str(phone or '').strip().replace(' ', '').replace('+', '')
-    if p.startswith('0') and len(p) == 10:
-        p = '254' + p[1:]
-    elif p.startswith('7') and len(p) == 9:
-        p = '254' + p
-    return p
-
-
-def send_live_otp_sms(phone: str, otp_code: str) -> bool:
-    """Dispatches verification signatures to live mobile network terminals."""
-    normalized = _normalize_phone(phone)
-    # Africa's Talking API requires explicit E.164 formatting including the '+' prefix
-    e164_phone = f"+{normalized}"
-    
-    message = f"Your Wambui Shadrack Advocates portal verification code is: {otp_code}. It expires in 10 minutes."
-    
-    if not sms_gateway:
-        logging.warning(f"🚨 LIVE SMS STUB LOG: Live Gateway unconfigured. Text to {e164_phone} would be: '{message}'")
-        return False
-        
-    try:
-        if AT_SENDER_ID:
-            response = sms_gateway.send(message, [e164_phone], AT_SENDER_ID)
-        else:
-            response = sms_gateway.send(message, [e164_phone])
-        logging.info(f"📡 SMS Gateway response for {e164_phone}: {response}")
-        return True
-    except Exception as e:
-        logging.error(f"❌ Failed to dispatch live SMS to terminal {e164_phone}: {e}")
-        return False
 
 
 def get_mpesa_access_token():
@@ -149,12 +168,9 @@ def initiate_stk_push(phone, amount, account_ref, description="Legal Fees"):
         "TransactionDesc": (description or "Legal Fees")[:13],
     }
     url = f"{MPESA_BASE}/mpesa/stkpush/v1/processrequest"
-    r = requests.post(
-        url,
-        json=payload,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        timeout=30,
-    )
+    r = requests.post(url, json=payload,
+                      headers={"Authorization": f"Bearer {token}",
+                               "Content-Type": "application/json"}, timeout=30)
     try:
         data = r.json()
     except Exception:
@@ -174,7 +190,7 @@ STRIPE_CURRENCY = os.environ.get('STRIPE_CURRENCY', 'kes').lower()
 
 
 # =========================================================
-# 🗄️ DATABASE CONNECTION MANAGEMENT
+# 🗄️ DATABASE MANAGEMENT
 # =========================================================
 def get_db():
     if 'db' not in g:
@@ -193,7 +209,7 @@ def init_db():
     try:
         conn = psycopg2.connect(app.config['DATABASE_URL'])
         cur = conn.cursor()
-        
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id SERIAL PRIMARY KEY,
@@ -202,23 +218,24 @@ def init_db():
                 role VARCHAR(50) NOT NULL
             );
         """)
-        
-        # PERSISTENT MULTI-WORKER OTP STORAGE
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS otp_vault (
                 phone_number VARCHAR(50) PRIMARY KEY,
                 code VARCHAR(6) NOT NULL,
+                case_number VARCHAR(255),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 expires_at TIMESTAMP NOT NULL
             );
         """)
-        
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cases (
                 case_id SERIAL PRIMARY KEY,
                 case_number VARCHAR(255) UNIQUE NOT NULL,
                 case_parties TEXT,
                 client_name VARCHAR(255),
+                client_phone VARCHAR(50),
                 next_court_date VARCHAR(255),
                 coming_up_for TEXT,
                 total_balance NUMERIC(15,2) DEFAULT 0.00,
@@ -226,7 +243,7 @@ def init_db():
                 ai_access_granted BOOLEAN DEFAULT FALSE
             );
         """)
-        
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ai_client_logs (
                 log_id SERIAL PRIMARY KEY,
@@ -237,7 +254,7 @@ def init_db():
                 logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS mpesa_transactions (
                 tx_id SERIAL PRIMARY KEY,
@@ -254,7 +271,7 @@ def init_db():
                 completed_at TIMESTAMP
             );
         """)
-        
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS stripe_transactions (
                 tx_id SERIAL PRIMARY KEY,
@@ -272,9 +289,9 @@ def init_db():
 
         seed_users = [
             ('Shadrack Wambui', '0700260086', 'admin'),
-            ('Jeff Kangethe', '0704704758', 'advocate'),
-            ('Jeff Kangethe', '0796178783', 'advocate'),
-            ('Jane Onyango', '0795204923', 'secretary'),
+            ('Jeff Kangethe',   '0704704758', 'advocate'),
+            ('Jeff Kangethe',   '0796178783', 'advocate'),
+            ('Jane Onyango',    '0795204923', 'secretary'),
         ]
         for name, phone, role in seed_users:
             cur.execute(
@@ -300,9 +317,17 @@ def cyber_security_check():
         allowed = ['login_router', 'verify_otp', 'toggle_kill_switch',
                    'mpesa_callback', 'stripe_webhook']
         if request.endpoint not in allowed:
-            logging.warning(f"BLOCKED: {request.endpoint} during lockdown")
             return jsonify({"success": False, "error": "SECURITY_LOCKDOWN",
                             "message": "⚠️ PORTAL LOCKDOWN ACTIVE."}), 503
+
+
+def _normalize_login_phone(credential: str) -> str:
+    p = credential.replace('+', '').replace(' ', '').replace('-', '')
+    if p.startswith('254') and len(p) == 12:
+        p = '0' + p[3:]
+    elif len(p) == 9 and p.startswith('7'):
+        p = '0' + p
+    return p
 
 
 # =========================================================
@@ -310,111 +335,65 @@ def cyber_security_check():
 # =========================================================
 @app.route('/api/auth/login-router', methods=['POST'])
 def login_router():
+    """
+    Unified entry endpoint for security handshakes.
+    Dispatches clients directly via Case Number or routes staff to 2FA paths.
+    """
     payload = request.get_json() or {}
-    credential = payload.get('credential', '').strip()
-    if not credential:
-        return jsonify({"success": False, "message": "Login field cannot be blank."}), 400
-    if credential.isdigit() and len(credential) >= 10:
-        return initiate_staff_login(credential)
-    return client_login(credential)
+    credential = (payload.get('credential') or '').strip()
+    case_number = (payload.get('case_number') or '').strip()
+    phone_number = (payload.get('phone_number') or payload.get('phone') or '').strip()
+
+    # Route explicitly to Instant Client Access if identity parameters point to a case signature
+    if case_number:
+        return execute_direct_client_login(case_number)
+        
+    if credential and not (credential.replace('+', '').replace(' ', '').replace('-', '').isdigit() and len(credential.replace('+', '').replace(' ', '').replace('-', '')) >= 9):
+        return execute_direct_client_login(credential)
+        
+    # Standard security protocol routing path for internal administrative staff members
+    target_phone = phone_number if phone_number else credential
+    if not target_phone:
+        return jsonify({"success": False, "message": "Login parameters cannot be blank."}), 400
+        
+    return initiate_staff_login(_normalize_login_phone(target_phone))
 
 
-def initiate_staff_login(phone):
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT full_name, phone_number, role FROM users
-            WHERE phone_number = %s AND role IN ('admin', 'advocate', 'secretary');
-        """, (phone,))
-        account = cur.fetchone()
-        if not account:
-            return jsonify({"success": False, "message": "Access Denied: Not registered staff."}), 403
-        
-        # Generation
-        otp = str(random.randint(100000, 999999))
-        
-        # Secure Database Persistence Injection (Bypasses local Ephemeral Memory constraints)
-        cur.execute("""
-            INSERT INTO otp_vault (phone_number, code, expires_at) 
-            VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
-            ON CONFLICT (phone_number) 
-            DO UPDATE SET code = %s, created_at = CURRENT_TIMESTAMP, expires_at = NOW() + INTERVAL '10 minutes';
-        """, (phone, otp, otp))
-        conn.commit()
-        
-        # Dispatch Live SMS to Staff Phone via Africa's Talking
-        sms_status = send_live_otp_sms(account['phone_number'], otp)
-        
-        logging.info(f"OTP database ledger written for {account['phone_number']}")
-        
-        if sms_status:
-            return jsonify({"success": True, "mode": "otp_required", "message": "OTP successfully dispatched to your mobile phone."})
-        else:
-            return jsonify({"success": True, "mode": "otp_required", "message": "OTP processed (check console/backup routes if delayed)."})
-            
-    except Exception as e:
-        return jsonify({"success": False, "message": f"Auth fault: {e}"}), 500
+def execute_direct_client_login(case_number):
+    """Bypasses 2FA entirely; resolves the legal case files and yields metrics dashboard instantaneously."""
+    if not case_number:
+        return jsonify({"success": False, "message": "Case number parsing metric cannot be empty."}), 400
 
-
-@app.route('/api/auth/verify-otp', methods=['POST'])
-def verify_otp():
-    data = request.get_json() or {}
-    phone = data.get('phone', '').strip()
-    code = data.get('code', '').strip()
-    
     try:
         conn = get_db()
         cur = conn.cursor()
         
-        # Validate match and strict expiration threshold
-        cur.execute("""
-            SELECT code FROM otp_vault 
-            WHERE phone_number = %s AND expires_at > NOW();
-        """, (phone,))
-        record = cur.fetchone()
-        
-        if not record or record['code'] != code:
-            return jsonify({"success": False, "message": "Invalid or expired OTP signature verification."}), 401
-            
-        # Clean up database entry to enforce one-time usage constraints
-        cur.execute("DELETE FROM otp_vault WHERE phone_number = %s;", (phone,))
-        
-        # Fetch staff meta profile safely
-        cur.execute("SELECT full_name, role FROM users WHERE phone_number = %s;", (phone,))
-        user_profile = cur.fetchone()
-        conn.commit()
-        
-        return jsonify({
-            "success": True, 
-            "role": user_profile['role'],
-            "user_name": user_profile['full_name'],
-            "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
-        })
-    except Exception as e:
-        return jsonify({"success": False, "message": f"Cryptographic vault read error: {e}"}), 500
-
-
-def client_login(case_number):
-    try:
-        conn = get_db()
-        cur = conn.cursor()
+        # Verify and fetch case dashboard record metrics directly in a single database roundtrip
         cur.execute("""
             SELECT case_id, case_number, case_parties, client_name, ai_access_granted,
                    next_court_date, coming_up_for, total_balance, paid_balance
-            FROM cases WHERE case_number ILIKE %s
+            FROM cases WHERE case_number ILIKE %s;
         """, (f"%{case_number}%",))
         case = cur.fetchone()
+        conn.commit()
+
         if not case:
-            return jsonify({"success": False, "message": "No case found."}), 404
+            return jsonify({"success": False, "message": "No legal case file located under that signature."}), 404
+
         total = float(case['total_balance'] or 0)
         paid = float(case['paid_balance'] or 0)
         score = random.randint(55, 98)
+        
+        logging.info(f"Direct authentication successful for Client Case: {case['case_number']}")
+
         return jsonify({
-            "success": True, "mode": "client_dashboard",
+            "success": True, 
+            "mode": "client_dashboard",
             "data": {
-                "case_id": case['case_id'], "case_number": case['case_number'],
-                "case_parties": case['case_parties'], "client_name": case['client_name'],
+                "case_id": case['case_id'],
+                "case_number": case['case_number'],
+                "case_parties": case['case_parties'],
+                "client_name": case['client_name'],
                 "next_court_date": str(case['next_court_date']),
                 "coming_up_for": case['coming_up_for'],
                 "financials": {"total": total, "paid": paid, "balance": total - paid},
@@ -423,56 +402,137 @@ def client_login(case_number):
                                    "analysis": f"Outcome trends at {score}% favorable."}
             }
         })
+
     except Exception as e:
-        return jsonify({"success": False, "message": f"DB failure: {e}"}), 500
+        logging.exception("Direct client dashboard compilation failure.")
+        return jsonify({"success": False, "message": f"Security system processing fault: {e}"}), 500
+
+
+def initiate_staff_login(phone):
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("""
+            SELECT full_name, phone_number, role FROM users
+            WHERE phone_number = %s AND role IN ('admin','advocate','secretary');
+        """, (phone,))
+        account = cur.fetchone()
+        if not account:
+            return jsonify({"success": False, "message": "Access Denied: Not registered staff."}), 403
+
+        otp = str(random.randint(100000, 999999))
+        cur.execute("""
+            INSERT INTO otp_vault (phone_number, code, case_number, expires_at)
+            VALUES (%s, %s, NULL, NOW() + INTERVAL '10 minutes')
+            ON CONFLICT (phone_number) DO UPDATE
+              SET code = EXCLUDED.code,
+                  case_number = NULL,
+                  created_at = CURRENT_TIMESTAMP,
+                  expires_at = EXCLUDED.expires_at;
+        """, (phone, otp))
+        conn.commit()
+
+        ok, info = send_live_otp_sms(account['phone_number'], otp)
+        logging.info(f"Staff OTP stored for {phone}; SMS ok={ok}; info={info}")
+
+        if ok:
+            return jsonify({"success": True, "mode": "otp_required",
+                            "message": "OTP sent to your phone."})
+        return jsonify({"success": False, "mode": "otp_failed",
+                        "message": f"OTP could not be delivered: {info}"}), 502
+
+    except Exception as e:
+        logging.exception("login error")
+        return jsonify({"success": False, "message": f"Auth fault: {e}"}), 500
+
+
+@app.route('/api/auth/verify-otp', methods=['POST'])
+def verify_otp():
+    """Handles operational verification challenges exclusively for internal staff profiles."""
+    data = request.get_json() or {}
+    phone = (data.get('phone') or '').strip()
+    code = (data.get('code') or '').strip()
+    
+    if not phone or not code:
+        return jsonify({"success": False, "message": "Identification fields or passcode missing."}), 400
+        
+    try:
+        clean_phone = _normalize_login_phone(phone)
+        conn = get_db(); cur = conn.cursor()
+
+        # Validate the generated token directly against the targeted vault registry path
+        cur.execute("""SELECT code FROM otp_vault
+                       WHERE phone_number=%s AND expires_at > NOW();""", (clean_phone,))
+        record = cur.fetchone()
+        if not record or record['code'] != code:
+            return jsonify({"success": False, "message": "Invalid or expired OTP signature."}), 401
+
+        # Enforce instant structural token clearance (Preventing credential replay exploits)
+        cur.execute("DELETE FROM otp_vault WHERE phone_number=%s;", (clean_phone,))
+        
+        cur.execute("SELECT full_name, role FROM users WHERE phone_number=%s;", (clean_phone,))
+        user_profile = cur.fetchone()
+        conn.commit()
+
+        if not user_profile:
+            return jsonify({"success": False, "message": "Staff user structural record missing."}), 404
+
+        return jsonify({
+            "success": True,
+            "role": user_profile['role'],
+            "user_name": user_profile['full_name'],
+            "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
+        })
+            
+    except Exception as e:
+        logging.exception("Verification processing system loop broken down.")
+        return jsonify({"success": False, "message": f"Vault engine data read failure: {e}"}), 500
 
 
 # =========================================================
-# 🤖 AI CORE PROCESSING
+# 🤖 AI ORCHESTRATION PIPELINE
 # =========================================================
 @app.route('/api/ai/consult', methods=['POST'])
 def ai_consult():
     data = request.get_json() or {}
-    question = data.get('question', '').strip()
-    user_name = data.get('user_name', '').strip()
-    case_number = data.get('case_number', '').strip()
-    ai_type = data.get('ai_type', 'free').strip().lower()
+    question = (data.get('question') or '').strip()
+    user_name = (data.get('user_name') or '').strip()
+    case_number = (data.get('case_number') or '').strip()
+    ai_type = (data.get('ai_type') or 'free').strip().lower()
 
     if not question:
         return jsonify({"success": False, "message": "Question cannot be blank."}), 400
 
     if user_name == "Shadrack Wambui":
-        ans = f"⚖️ [Admin AI - Constitution 2010]: For '{question}', see Chapter Four (Bill of Rights)."
-        return jsonify({"success": True, "engine": "Constitution 2010", "answer": ans})
+        return jsonify({"success": True, "engine": "Constitution 2010",
+                        "answer": f"⚖️ [Admin AI]: For '{question}', see Chapter Four."})
 
     if user_name:
-        ans = f"📋 [Staff Assistant AI - {user_name}]: Processing '{question}'."
-        return jsonify({"success": True, "engine": "Staff Assistant Free AI", "answer": ans})
+        return jsonify({"success": True, "engine": "Staff Assistant Free AI",
+                        "answer": f"📋 [Staff AI - {user_name}]: Processing '{question}'."})
 
     if case_number:
         try:
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute("SELECT client_name, ai_access_granted FROM cases WHERE case_number = %s", (case_number,))
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("SELECT client_name, ai_access_granted FROM cases WHERE case_number=%s",
+                        (case_number,))
             case_record = cur.fetchone()
             if not case_record:
                 return jsonify({"success": False, "message": "Case not found."}), 404
 
             if ai_type == "consultant":
-                if case_record['ai_access_granted']:
-                    ans = f"🧠 [Premium Consultant AI]: Strategic evaluation for '{question}'."
-                    engine = "Paid Consultant AI"
-                else:
+                if not case_record['ai_access_granted']:
                     return jsonify({"success": False,
-                                    "message": "Premium Consultant AI requires KES 5,000 activation."}), 402
+                                    "message": "Premium AI requires KES 5,000 activation."}), 402
+                ans = f"🧠 [Premium AI]: Strategic evaluation for '{question}'."
+                engine = "Paid Consultant AI"
             else:
                 ans = f"ℹ️ [Client Free AI]: Summary for '{question}'."
                 engine = "Client Free AI"
 
-            cur.execute("""
-                INSERT INTO ai_client_logs (case_number, client_name, client_question, ai_response)
-                VALUES (%s, %s, %s, %s)
-            """, (case_number, case_record['client_name'], question, ans))
+            cur.execute("""INSERT INTO ai_client_logs
+                (case_number, client_name, client_question, ai_response)
+                VALUES (%s, %s, %s, %s)""",
+                (case_number, case_record['client_name'], question, ans))
             conn.commit()
             return jsonify({"success": True, "engine": engine, "answer": ans})
         except Exception as e:
@@ -482,7 +542,7 @@ def ai_consult():
 
 
 # =========================================================
-# 💸 TRANSACTIONS SYSTEM LAYER
+# 💸 PAYMENT TRANSACTION ENGINES
 # =========================================================
 @app.route('/api/public/process-payment', methods=['POST'])
 def process_payment():
@@ -507,20 +567,17 @@ def process_payment():
         return jsonify({"success": False, "message": "Phone number required for M-Pesa."}), 400
 
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT case_number FROM cases WHERE case_number = %s", (account_number,))
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT case_number FROM cases WHERE case_number=%s", (account_number,))
         if not cur.fetchone():
             return jsonify({"success": False, "message": "Account does not match any case."}), 404
 
         float_amount = float(amount)
 
-        # M-PESA LOGIC
         if payment_method == 'mpesa':
             try:
                 status_code, resp = initiate_stk_push(phone_number, float_amount, account_number)
             except Exception as e:
-                logging.error(f"STK push exception: {e}")
                 return jsonify({"success": False, "message": f"M-Pesa gateway error: {e}"}), 502
 
             if status_code == 200 and str(resp.get('ResponseCode')) == '0':
@@ -533,16 +590,15 @@ def process_payment():
                       resp.get('MerchantRequestID'), resp.get('CheckoutRequestID')))
                 conn.commit()
                 return jsonify({"success": True,
-                                "message": f"M-Pesa prompt sent to {phone_number}. Enter your PIN.",
+                                "message": f"M-Pesa prompt sent to {phone_number}.",
                                 "checkout_request_id": resp.get('CheckoutRequestID')})
             return jsonify({"success": False,
                             "message": resp.get('errorMessage') or resp.get('CustomerMessage') or "STK push rejected.",
                             "daraja": resp}), 400
 
-        # STRIPE INTERFACE
         if payment_method == 'card':
             if not stripe.api_key:
-                return jsonify({"success": False, "message": "Stripe not configured (set STRIPE_SECRET_KEY)."}), 500
+                return jsonify({"success": False, "message": "Stripe not configured."}), 500
             try:
                 amount_minor = int(round(float_amount * 100))
                 session = stripe.checkout.Session.create(
@@ -560,10 +616,7 @@ def process_payment():
                         'quantity': 1,
                     }],
                     customer_email=customer_email or None,
-                    metadata={
-                        'case_number': account_number,
-                        'amount_kes': str(float_amount),
-                    },
+                    metadata={'case_number': account_number, 'amount_kes': str(float_amount)},
                     success_url=f"{STRIPE_SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
                     cancel_url=STRIPE_CANCEL_URL,
                 )
@@ -574,24 +627,51 @@ def process_payment():
                     ON CONFLICT (stripe_session_id) DO NOTHING
                 """, (account_number, float_amount, STRIPE_CURRENCY, session.id, customer_email or None))
                 conn.commit()
-                return jsonify({
-                    "success": True,
-                    "message": "Redirect checkout initialized.",
-                    "checkout_url": session.url,
-                    "session_id": session.id,
-                })
+                return jsonify({"success": True, "message": "Redirect checkout initialized.",
+                                "checkout_url": session.url, "session_id": session.id})
             except stripe.error.StripeError as e:
-                logging.error(f"Stripe error: {e}")
                 return jsonify({"success": False, "message": f"Stripe error: {str(e)}"}), 502
             except Exception as e:
-                logging.error(f"Stripe exception: {e}")
                 return jsonify({"success": False, "message": f"Card gateway error: {e}"}), 500
 
     except Exception as e:
         return jsonify({"success": False, "message": f"Payment failure: {e}"}), 500
 
 
-# M-PESA SYSTEM HOOK
+@app.route('/api/billing/ai-unlock', methods=['POST'])
+def ai_unlock():
+    data = request.get_json() or {}
+    amount = data.get('amount')
+    phone = (data.get('phone') or '').strip()
+    case_number = (data.get('case_number') or '').strip()
+    if not case_number or not phone or not amount:
+        return jsonify({"success": False, "message": "Missing fields."}), 400
+    try:
+        status_code, resp = initiate_stk_push(phone, float(amount), case_number, "AI Unlock")
+    except Exception as e:
+        return jsonify({"success": False, "message": f"M-Pesa gateway error: {e}"}), 502
+
+    if status_code == 200 and str(resp.get('ResponseCode')) == '0':
+        try:
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("""INSERT INTO mpesa_transactions
+                (case_number, phone_number, amount, merchant_request_id, checkout_request_id, status)
+                VALUES (%s,%s,%s,%s,%s,'PENDING')
+                ON CONFLICT (checkout_request_id) DO NOTHING""",
+                (case_number, _normalize_phone(phone), float(amount),
+                 resp.get('MerchantRequestID'), resp.get('CheckoutRequestID')))
+            conn.commit()
+        except Exception as e:
+            logging.error(f"Insert error: {e}")
+        return jsonify({"success": True, "message": "STK prompt sent. Enter your M-Pesa PIN.",
+                        "checkout_request_id": resp.get('CheckoutRequestID')})
+    return jsonify({"success": False,
+                    "message": resp.get('errorMessage') or resp.get('CustomerMessage') or "STK push rejected."}), 400
+
+
+# =========================================================
+# 🪝 GATEWAY PRODUCTION WEBHOOKS
+# =========================================================
 @app.route('/api/public/mpesa/callback', methods=['POST'])
 def mpesa_callback():
     try:
@@ -610,8 +690,7 @@ def mpesa_callback():
                 elif item.get('Name') == 'Amount':
                     amount_paid = float(item.get('Value') or 0)
 
-        conn = get_db()
-        cur = conn.cursor()
+        conn = get_db(); cur = conn.cursor()
         cur.execute("""
             UPDATE mpesa_transactions
             SET result_code=%s, result_desc=%s, mpesa_receipt=%s,
@@ -638,27 +717,20 @@ def mpesa_callback():
         return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
 
 
-# STRIPE TRANSACTION WEBHOOK
 @app.route('/api/public/stripe/webhook', methods=['POST'])
 def stripe_webhook():
     payload = request.get_data(as_text=False)
     sig_header = request.headers.get('Stripe-Signature', '')
-    
-    # Absolute production safety rule: Fail immediately if signature secret missing
     if not STRIPE_WEBHOOK_SECRET:
-        logging.error("STRIPE_WEBHOOK_SECRET variable is unconfigured.")
         return jsonify({"error": "Security Misconfiguration"}), 500
-        
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
-        logging.error(f"Stripe webhook signature validation failed: {e}")
-        return jsonify({"error": "Invalid Cryptographic Signature"}), 400
+        return jsonify({"error": f"Invalid signature: {e}"}), 400
 
     try:
         etype = event['type']
         obj = event['data']['object']
-
         if etype == 'checkout.session.completed':
             session_id = obj.get('id')
             payment_intent = obj.get('payment_intent')
@@ -667,8 +739,7 @@ def stripe_webhook():
             case_number = metadata.get('case_number')
             amount_total = (obj.get('amount_total') or 0) / 100.0
 
-            conn = get_db()
-            cur = conn.cursor()
+            conn = get_db(); cur = conn.cursor()
             cur.execute("""
                 UPDATE stripe_transactions
                 SET status=%s, stripe_payment_intent=%s, completed_at=CURRENT_TIMESTAMP
@@ -677,35 +748,31 @@ def stripe_webhook():
             """, ('SUCCESS' if payment_status == 'paid' else 'PENDING',
                   payment_intent, session_id))
             row = cur.fetchone()
-
             if payment_status == 'paid' and case_number:
                 credited = float(row['amount']) if row else amount_total
                 cur.execute("""
                     UPDATE cases
                     SET paid_balance = paid_balance + %s,
                         ai_access_granted = (ai_access_granted OR %s)
-                    WHERE case_number = %s
+                    WHERE case_number=%s
                 """, (credited, credited >= 5000, case_number))
             conn.commit()
 
         elif etype in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
             session_id = obj.get('id')
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE stripe_transactions SET status='FAILED', completed_at=CURRENT_TIMESTAMP
-                WHERE stripe_session_id=%s
-            """, (session_id,))
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("""UPDATE stripe_transactions
+                           SET status='FAILED', completed_at=CURRENT_TIMESTAMP
+                           WHERE stripe_session_id=%s""", (session_id,))
             conn.commit()
 
         return jsonify({"received": True})
     except Exception as e:
-        logging.error(f"Stripe webhook handler failure: {e}")
         return jsonify({"error": str(e)}), 500
 
 
 # =========================================================
-# STATE POLLERS & BACKEND UTILITIES
+# 📊 STATUS POLLERS
 # =========================================================
 @app.route('/api/payment/mpesa-status/<checkout_request_id>', methods=['GET'])
 def mpesa_status(checkout_request_id):
@@ -737,96 +804,28 @@ def stripe_status(session_id):
         return jsonify({"success": False, "message": str(e)}), 500
 
 
-@app.route('/api/documents/upload', methods=['POST'])
-def document_upload():
-    if 'document' not in request.files:
-        return jsonify({"success": False, "message": "No document attached."}), 400
-    f = request.files['document']
-    name = secure_filename(f.filename)
-    f.save(os.path.join(app.config['UPLOAD_FOLDER'], name))
-    return jsonify({"success": True, "message": "Document uploaded."})
-
-
 # =========================================================
-# 🏢 FIRM STAFF CONTROLS
+# 🩺 METRICS & DIAGNOSTICS
 # =========================================================
-@app.route('/api/staff/search', methods=['POST'])
-def search_cases():
+@app.route('/api/diag/sms-test', methods=['POST'])
+def sms_test():
     data = request.get_json() or {}
-    query = data.get('query', '').strip()
-    user_name = data.get('user_name', '').strip()
-    try:
-        conn = get_db(); cur = conn.cursor()
-        if not query:
-            cur.execute("""
-                SELECT case_id, case_number, case_parties, client_name, total_balance,
-                       paid_balance, next_court_date, coming_up_for
-                FROM cases ORDER BY case_id DESC
-            """)
-        else:
-            term = f"%{query}%"
-            cur.execute("""
-                SELECT case_id, case_number, case_parties, client_name, total_balance,
-                       paid_balance, next_court_date, coming_up_for
-                FROM cases
-                WHERE case_number ILIKE %s OR client_name ILIKE %s OR case_parties ILIKE %s
-                ORDER BY case_id DESC
-            """, (term, term, term))
-        results = cur.fetchall()
-        for row in results:
-            if user_name != "Shadrack Wambui":
-                row['total_balance'] = "RESTRICTED"
-                row['paid_balance'] = "RESTRICTED"
-        return jsonify({"success": True, "results": results})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+    phone = (data.get('phone') or '').strip()
+    code = (data.get('code') or '123456').strip()
+    if not phone:
+        return jsonify({"success": False, "message": "phone required"}), 400
+    ok, info = send_live_otp_sms(phone, code)
+    return jsonify({"success": ok, "info": info,
+                    "at_username": AT_USERNAME,
+                    "at_sender_id": AT_SENDER_ID,
+                    "sms_gateway_loaded": bool(sms_gateway)})
 
 
-@app.route('/api/staff/ai-monitoring', methods=['GET'])
-def monitor_client_ai():
-    try:
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("""SELECT log_id, case_number, client_name, client_question,
-                              ai_response, logged_at
-                       FROM ai_client_logs ORDER BY logged_at DESC""")
-        return jsonify({"success": True, "logs": cur.fetchall()})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
-
-@app.route('/api/staff/update-matter', methods=['POST'])
-def update_matter():
-    data = request.get_json() or {}
-    user_name = data.get('user_name', '').strip()
-    case_id = data.get('case_id')
-    next_court_date = data.get('next_court_date')
-    coming_up_for = data.get('coming_up_for')
-
-    try:
-        conn = get_db(); cur = conn.cursor()
-        if user_name != "Shadrack Wambui":
-            cur.execute("SELECT total_balance, paid_balance FROM cases WHERE case_id = %s", (case_id,))
-            current = cur.fetchone()
-            if current:
-                it = data.get('total_balance')
-                ip = data.get('paid_balance')
-                if (it is not None and str(it) != "RESTRICTED" and float(it) != float(current['total_balance'])) or \
-                   (ip is not None and str(ip) != "RESTRICTED" and float(ip) != float(current['paid_balance'])):
-                    return jsonify({"success": False, "message": "Only Shadrack Wambui may edit financials."}), 403
-
-        cur.execute("""
-            UPDATE cases
-            SET next_court_date=%s, coming_up_for=%s, total_balance=%s, paid_balance=%s
-            WHERE case_id=%s
-        """, (next_court_date, coming_up_for, data.get('total_balance'), data.get('paid_balance'), case_id))
-        
-        conn.commit()
-        return jsonify({"success": True, "message": "Matter records modernized successfully."})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({"ok": True, "lockdown": SYSTEM_STATE["LOCKDOWN_MODE"]})
 
 
 if __name__ == '__main__':
-    # Keep debug=False on live web servers to shield environment variables from leaking
     init_db()
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
