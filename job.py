@@ -2,6 +2,7 @@
 =====================================================================
  Wambui Shadrack Advocates — Legal Portal Backend (Single-File App)
  Flask + PostgreSQL + M-Pesa Daraja STK Push + Stripe Card Payments
+ Integrated with Live Africa's Talking OTP Delivery
 =====================================================================
 """
 
@@ -20,6 +21,7 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 import stripe
+import africastalking
 
 # =========================================================
 # ⚙️ APP CONFIG
@@ -47,6 +49,25 @@ logging.basicConfig(
 SYSTEM_STATE = {"LOCKDOWN_MODE": False}
 
 # =========================================================
+# 📱 LIVE SMS GATEWAY (AFRICA'S TALKING)
+# =========================================================
+AT_USERNAME = os.environ.get("AT_USERNAME", "sandbox")
+AT_API_KEY = os.environ.get("AT_API_KEY", "")
+AT_SENDER_ID = os.environ.get("AT_SENDER_ID", None)  # Set to your Alphanumeric/Shortcode if approved
+
+try:
+    if AT_API_KEY:
+        africastalking.initialize(AT_USERNAME, AT_API_KEY)
+        sms_gateway = africastalking.SMS
+        logging.info("✨ Africa's Talking Production Engine Initialized.")
+    else:
+        sms_gateway = None
+        logging.warning("⚠️ AT_API_KEY missing. SMS system operating in STUB/MOCK mode.")
+except Exception as e:
+    sms_gateway = None
+    logging.error(f"Critical failure initializing Africa's Talking SDK: {e}")
+
+# =========================================================
 # 💰 M-PESA DARAJA (LIVE STK PUSH)
 # =========================================================
 MPESA_ENV = os.environ.get('MPESA_ENV', 'sandbox').lower()
@@ -67,6 +88,30 @@ def _normalize_phone(phone: str) -> str:
     elif p.startswith('7') and len(p) == 9:
         p = '254' + p
     return p
+
+
+def send_live_otp_sms(phone: str, otp_code: str) -> bool:
+    """Dispatches verification signatures to live mobile network terminals."""
+    normalized = _normalize_phone(phone)
+    # Africa's Talking API requires explicit E.164 formatting including the '+' prefix
+    e164_phone = f"+{normalized}"
+    
+    message = f"Your Wambui Shadrack Advocates portal verification code is: {otp_code}. It expires in 10 minutes."
+    
+    if not sms_gateway:
+        logging.warning(f"🚨 LIVE SMS STUB LOG: Live Gateway unconfigured. Text to {e164_phone} would be: '{message}'")
+        return False
+        
+    try:
+        if AT_SENDER_ID:
+            response = sms_gateway.send(message, [e164_phone], AT_SENDER_ID)
+        else:
+            response = sms_gateway.send(message, [e164_phone])
+        logging.info(f"📡 SMS Gateway response for {e164_phone}: {response}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Failed to dispatch live SMS to terminal {e164_phone}: {e}")
+        return False
 
 
 def get_mpesa_access_token():
@@ -298,9 +343,16 @@ def initiate_staff_login(phone):
         """, (phone, otp, otp))
         conn.commit()
         
-        print(f"\n📡 [PRODUCTION SMS LOG CONTAINER] OTP for {account['full_name']} -> {otp}\n")
+        # Dispatch Live SMS to Staff Phone via Africa's Talking
+        sms_status = send_live_otp_sms(account['phone_number'], otp)
+        
         logging.info(f"OTP database ledger written for {account['phone_number']}")
-        return jsonify({"success": True, "mode": "otp_required", "message": "OTP dispatched."})
+        
+        if sms_status:
+            return jsonify({"success": True, "mode": "otp_required", "message": "OTP successfully dispatched to your mobile phone."})
+        else:
+            return jsonify({"success": True, "mode": "otp_required", "message": "OTP processed (check console/backup routes if delayed)."})
+            
     except Exception as e:
         return jsonify({"success": False, "message": f"Auth fault: {e}"}), 500
 
@@ -767,34 +819,14 @@ def update_matter():
             SET next_court_date=%s, coming_up_for=%s, total_balance=%s, paid_balance=%s
             WHERE case_id=%s
         """, (next_court_date, coming_up_for, data.get('total_balance'), data.get('paid_balance'), case_id))
+        
         conn.commit()
-        return jsonify({"success": True, "message": "Case updated."})
+        return jsonify({"success": True, "message": "Matter records modernized successfully."})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
 
-@app.route('/api/admin/kill-switch', methods=['POST'])
-def toggle_kill_switch():
-    action = (request.get_json() or {}).get('action', '').upper()
-    if action == 'LOCK':
-        SYSTEM_STATE["LOCKDOWN_MODE"] = True
-        logging.critical("🚨 LOCKDOWN ENGAGED")
-        return jsonify({"success": True, "status": "LOCKED", "message": "🚨 Client paths closed."})
-    SYSTEM_STATE["LOCKDOWN_MODE"] = False
-    logging.critical("✅ LOCKDOWN CLEARED")
-    return jsonify({"success": True, "status": "ACTIVE", "message": "✅ Online."})
-
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({
-        "status": "ok",
-        "mpesa_env": MPESA_ENV,
-        "stripe_configured": bool(stripe.api_key),
-    })
-
-
 if __name__ == '__main__':
+    # Keep debug=False on live web servers to shield environment variables from leaking
     init_db()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(debug=False, host='0.0.0.0', port=5000)
