@@ -45,7 +45,7 @@ SYSTEM_STATE = {"LOCKDOWN_MODE": False}
 # =========================================================
 # 📱 LIVE SMS GATEWAY (AFRICA'S TALKING - STAFF ONLY)
 # =========================================================
-AT_USERNAME = os.environ.get("AT_USERNAME", "sandbox")
+AT_USERNAME = os.environ.get("AT_USERNAME", "shadrack5736")
 AT_API_KEY = os.environ.get("AT_API_KEY", "")
 AT_SENDER_ID = os.environ.get("AT_SENDER_ID", "").strip() or None
 
