@@ -293,10 +293,10 @@ def init_db():
         """)
 
         seed_users = [
-            ('Shadrack Wambui', '0700260086', 'shadrack@wambuiadvocates.com', 'admin'),
+            ('Shadrack Wambui', '0700260086', 'shadrackwambui@gmail.com', 'admin'),
             ('Jeff Kangethe',   '0704704758', 'jeff.k@wambuiadvocates.com', 'advocate'),
-            ('Jeff Kangethe',   '0796178783', 'jeff.k2@wambuiadvocates.com', 'advocate'),
-            ('Jane Onyango',    '0795204923', 'jane@wambuiadvocates.com', 'secretary'),
+            ('Jeff Kangethe',   '0796178783', 'nduatijosephmwangi@gmail.com', 'advocate'),
+            ('Jane Onyango',    '0795204923', 'janeonyangokenya@gmail.com', 'secretary'),
         ]
         for name, phone, email, role in seed_users:
             cur.execute("""
