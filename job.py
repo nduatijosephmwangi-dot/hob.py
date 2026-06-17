@@ -2,7 +2,7 @@
 =====================================================================
  Wambui Shadrack Advocates — Legal Portal Backend (Single-File App)
  Flask + PostgreSQL + M-Pesa Daraja STK Push + Stripe Card Payments
- Integrated with Live Africa's Talking OTP Delivery for Staff
+ Integrated with Live Africa's Talking OTP Delivery
 =====================================================================
 """
 
@@ -43,9 +43,9 @@ logging.basicConfig(level=logging.INFO,
 SYSTEM_STATE = {"LOCKDOWN_MODE": False}
 
 # =========================================================
-# 📱 LIVE SMS GATEWAY (AFRICA'S TALKING - STAFF ONLY)
+# 📱 LIVE SMS GATEWAY (AFRICA'S TALKING)
 # =========================================================
-AT_USERNAME = os.environ.get("AT_USERNAME", "shadrack5736")
+AT_USERNAME = os.environ.get("AT_USERNAME", "sandbox")
 AT_API_KEY = os.environ.get("AT_API_KEY", "")
 AT_SENDER_ID = os.environ.get("AT_SENDER_ID", "").strip() or None
 
@@ -99,9 +99,11 @@ def send_live_otp_sms(phone: str, otp_code: str):
         status = r.get('status', '')
         status_code = r.get('statusCode')
 
+        # 101 Success | 102 Sent | 100 Processed
         if status_code in (100, 101, 102) or status.lower() == 'success':
             return True, f"Delivered to gateway: {status}"
 
+        # Common live-account failure: InvalidSenderId — retry with default
         if AT_SENDER_ID and ('SenderId' in status or status_code == 406):
             logging.warning(f"Retrying without sender_id (was '{AT_SENDER_ID}')")
             response2 = _try_send(None)
@@ -190,7 +192,7 @@ STRIPE_CURRENCY = os.environ.get('STRIPE_CURRENCY', 'kes').lower()
 
 
 # =========================================================
-# 🗄️ DATABASE MANAGEMENT
+# 🗄️ DATABASE
 # =========================================================
 def get_db():
     if 'db' not in g:
@@ -219,11 +221,15 @@ def init_db():
             );
         """)
 
+        # Add support for email lookup
+        cur.execute("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255) UNIQUE;
+        """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS otp_vault (
                 phone_number VARCHAR(50) PRIMARY KEY,
                 code VARCHAR(6) NOT NULL,
-                case_number VARCHAR(255),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 expires_at TIMESTAMP NOT NULL
             );
@@ -235,7 +241,6 @@ def init_db():
                 case_number VARCHAR(255) UNIQUE NOT NULL,
                 case_parties TEXT,
                 client_name VARCHAR(255),
-                client_phone VARCHAR(50),
                 next_court_date VARCHAR(255),
                 coming_up_for TEXT,
                 total_balance NUMERIC(15,2) DEFAULT 0.00,
@@ -288,17 +293,16 @@ def init_db():
         """)
 
         seed_users = [
-            ('Shadrack Wambui', '0700260086', 'admin'),
-            ('Jeff Kangethe',   '0704704758', 'advocate'),
-            ('Jeff Kangethe',   '0796178783', 'advocate'),
-            ('Jane Onyango',    '0795204923', 'secretary'),
+            ('Shadrack Wambui', '0700260086', 'shadrack@wambuiadvocates.com', 'admin'),
+            ('Jeff Kangethe',   '0704704758', 'jeff.k@wambuiadvocates.com', 'advocate'),
+            ('Jeff Kangethe',   '0796178783', 'jeff.k2@wambuiadvocates.com', 'advocate'),
+            ('Jane Onyango',    '0795204923', 'jane@wambuiadvocates.com', 'secretary'),
         ]
-        for name, phone, role in seed_users:
-            cur.execute(
-                "INSERT INTO users (full_name, phone_number, role) VALUES (%s, %s, %s) "
-                "ON CONFLICT (phone_number) DO NOTHING;",
-                (name, phone, role),
-            )
+        for name, phone, email, role in seed_users:
+            cur.execute("""
+                INSERT INTO users (full_name, phone_number, email, role) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (phone_number) DO UPDATE SET email = EXCLUDED.email;
+            """, (name, phone, email, role))
 
         conn.commit()
         cur.close()
@@ -331,64 +335,113 @@ def _normalize_login_phone(credential: str) -> str:
 
 
 # =========================================================
-# 🔐 SECURE PORTAL ROUTING LAYER
+# 🔐 AUTH
 # =========================================================
 @app.route('/api/auth/login-router', methods=['POST'])
 def login_router():
-    """
-    Unified entry endpoint for security handshakes.
-    Dispatches clients directly via Case Number or routes staff to 2FA paths.
-    """
     payload = request.get_json() or {}
     credential = (payload.get('credential') or '').strip()
-    case_number = (payload.get('case_number') or '').strip()
-    phone_number = (payload.get('phone_number') or payload.get('phone') or '').strip()
+    if not credential:
+        return jsonify({"success": False, "message": "Login field cannot be blank."}), 400
 
-    # Route explicitly to Instant Client Access if identity parameters point to a case signature
-    if case_number:
-        return execute_direct_client_login(case_number)
-        
-    if credential and not (credential.replace('+', '').replace(' ', '').replace('-', '').isdigit() and len(credential.replace('+', '').replace(' ', '').replace('-', '')) >= 9):
-        return execute_direct_client_login(credential)
-        
-    # Standard security protocol routing path for internal administrative staff members
-    target_phone = phone_number if phone_number else credential
-    if not target_phone:
-        return jsonify({"success": False, "message": "Login parameters cannot be blank."}), 400
-        
-    return initiate_staff_login(_normalize_login_phone(target_phone))
+    # Clean character separation to route based on identity format
+    if '@' in credential:
+        return initiate_staff_login(credential.lower())
+    return client_login(credential)
 
 
-def execute_direct_client_login(case_number):
-    """Bypasses 2FA entirely; resolves the legal case files and yields metrics dashboard instantaneously."""
-    if not case_number:
-        return jsonify({"success": False, "message": "Case number parsing metric cannot be empty."}), 400
-
+def initiate_staff_login(email):
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        
-        # Verify and fetch case dashboard record metrics directly in a single database roundtrip
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("""
+            SELECT full_name, phone_number, role FROM users
+            WHERE LOWER(email) = %s AND role IN ('admin','advocate','secretary');
+        """, (email,))
+        account = cur.fetchone()
+        if not account:
+            return jsonify({"success": False, "message": "Access Denied: Not registered staff email."}), 403
+
+        phone = account['phone_number']
+        otp = str(random.randint(100000, 999999))
+        cur.execute("""
+            INSERT INTO otp_vault (phone_number, code, expires_at)
+            VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
+            ON CONFLICT (phone_number) DO UPDATE
+              SET code = EXCLUDED.code,
+                  created_at = CURRENT_TIMESTAMP,
+                  expires_at = EXCLUDED.expires_at;
+        """, (phone, otp))
+        conn.commit()
+
+        ok, info = send_live_otp_sms(phone, otp)
+        logging.info(f"OTP stored for {phone} ({email}); SMS ok={ok}; info={info}")
+
+        if ok:
+            return jsonify({
+                "success": True, 
+                "mode": "otp_required",
+                "phone": phone, # Returns phone context safely back to frontend for the verification challenge
+                "message": "OTP sent to your registered phone number."
+            })
+        # SMS failed — be honest with the frontend
+        return jsonify({"success": False, "mode": "otp_failed",
+                        "message": f"OTP could not be delivered: {info}"}), 502
+
+    except Exception as e:
+        logging.exception("login error")
+        return jsonify({"success": False, "message": f"Auth fault: {e}"}), 500
+
+
+@app.route('/api/auth/verify-otp', methods=['POST'])
+def verify_otp():
+    data = request.get_json() or {}
+    phone = (data.get('phone') or '').strip()
+    code = (data.get('code') or '').strip()
+    try:
+        clean_phone = _normalize_login_phone(phone)
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("""SELECT code FROM otp_vault
+                       WHERE phone_number=%s AND expires_at > NOW();""", (clean_phone,))
+        record = cur.fetchone()
+        if not record or record['code'] != code:
+            return jsonify({"success": False, "message": "Invalid or expired OTP."}), 401
+
+        cur.execute("DELETE FROM otp_vault WHERE phone_number=%s;", (clean_phone,))
+        cur.execute("SELECT full_name, role FROM users WHERE phone_number=%s;", (clean_phone,))
+        user_profile = cur.fetchone()
+        conn.commit()
+
+        if not user_profile:
+            return jsonify({"success": False, "message": "Staff profile missing."}), 404
+
+        return jsonify({
+            "success": True,
+            "role": user_profile['role'],
+            "user_name": user_profile['full_name'],
+            "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
+        })
+    except Exception as e:
+        logging.exception("verify error")
+        return jsonify({"success": False, "message": f"Vault read error: {e}"}), 500
+
+
+def client_login(case_number):
+    try:
+        conn = get_db(); cur = conn.cursor()
         cur.execute("""
             SELECT case_id, case_number, case_parties, client_name, ai_access_granted,
                    next_court_date, coming_up_for, total_balance, paid_balance
-            FROM cases WHERE case_number ILIKE %s;
+            FROM cases WHERE case_number ILIKE %s
         """, (f"%{case_number}%",))
         case = cur.fetchone()
-        conn.commit()
-
         if not case:
-            return jsonify({"success": False, "message": "No legal case file located under that signature."}), 404
+            return jsonify({"success": False, "message": "No case found with that Case Number."}), 404
 
         total = float(case['total_balance'] or 0)
         paid = float(case['paid_balance'] or 0)
         score = random.randint(55, 98)
-        
-        logging.info(f"Direct authentication successful for Client Case: {case['case_number']}")
-
         return jsonify({
-            "success": True, 
-            "mode": "client_dashboard",
+            "success": True, "mode": "client_dashboard",
             "data": {
                 "case_id": case['case_id'],
                 "case_number": case['case_number'],
@@ -402,94 +455,12 @@ def execute_direct_client_login(case_number):
                                    "analysis": f"Outcome trends at {score}% favorable."}
             }
         })
-
     except Exception as e:
-        logging.exception("Direct client dashboard compilation failure.")
-        return jsonify({"success": False, "message": f"Security system processing fault: {e}"}), 500
-
-
-def initiate_staff_login(phone):
-    try:
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("""
-            SELECT full_name, phone_number, role FROM users
-            WHERE phone_number = %s AND role IN ('admin','advocate','secretary');
-        """, (phone,))
-        account = cur.fetchone()
-        if not account:
-            return jsonify({"success": False, "message": "Access Denied: Not registered staff."}), 403
-
-        otp = str(random.randint(100000, 999999))
-        cur.execute("""
-            INSERT INTO otp_vault (phone_number, code, case_number, expires_at)
-            VALUES (%s, %s, NULL, NOW() + INTERVAL '10 minutes')
-            ON CONFLICT (phone_number) DO UPDATE
-              SET code = EXCLUDED.code,
-                  case_number = NULL,
-                  created_at = CURRENT_TIMESTAMP,
-                  expires_at = EXCLUDED.expires_at;
-        """, (phone, otp))
-        conn.commit()
-
-        ok, info = send_live_otp_sms(account['phone_number'], otp)
-        logging.info(f"Staff OTP stored for {phone}; SMS ok={ok}; info={info}")
-
-        if ok:
-            return jsonify({"success": True, "mode": "otp_required",
-                            "message": "OTP sent to your phone."})
-        return jsonify({"success": False, "mode": "otp_failed",
-                        "message": f"OTP could not be delivered: {info}"}), 502
-
-    except Exception as e:
-        logging.exception("login error")
-        return jsonify({"success": False, "message": f"Auth fault: {e}"}), 500
-
-
-@app.route('/api/auth/verify-otp', methods=['POST'])
-def verify_otp():
-    """Handles operational verification challenges exclusively for internal staff profiles."""
-    data = request.get_json() or {}
-    phone = (data.get('phone') or '').strip()
-    code = (data.get('code') or '').strip()
-    
-    if not phone or not code:
-        return jsonify({"success": False, "message": "Identification fields or passcode missing."}), 400
-        
-    try:
-        clean_phone = _normalize_login_phone(phone)
-        conn = get_db(); cur = conn.cursor()
-
-        # Validate the generated token directly against the targeted vault registry path
-        cur.execute("""SELECT code FROM otp_vault
-                       WHERE phone_number=%s AND expires_at > NOW();""", (clean_phone,))
-        record = cur.fetchone()
-        if not record or record['code'] != code:
-            return jsonify({"success": False, "message": "Invalid or expired OTP signature."}), 401
-
-        # Enforce instant structural token clearance (Preventing credential replay exploits)
-        cur.execute("DELETE FROM otp_vault WHERE phone_number=%s;", (clean_phone,))
-        
-        cur.execute("SELECT full_name, role FROM users WHERE phone_number=%s;", (clean_phone,))
-        user_profile = cur.fetchone()
-        conn.commit()
-
-        if not user_profile:
-            return jsonify({"success": False, "message": "Staff user structural record missing."}), 404
-
-        return jsonify({
-            "success": True,
-            "role": user_profile['role'],
-            "user_name": user_profile['full_name'],
-            "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
-        })
-            
-    except Exception as e:
-        logging.exception("Verification processing system loop broken down.")
-        return jsonify({"success": False, "message": f"Vault engine data read failure: {e}"}), 500
+        return jsonify({"success": False, "message": f"DB failure: {e}"}), 500
 
 
 # =========================================================
-# 🤖 AI ORCHESTRATION PIPELINE
+# 🤖 AI
 # =========================================================
 @app.route('/api/ai/consult', methods=['POST'])
 def ai_consult():
@@ -542,7 +513,7 @@ def ai_consult():
 
 
 # =========================================================
-# 💸 PAYMENT TRANSACTION ENGINES
+# 💸 PAYMENTS
 # =========================================================
 @app.route('/api/public/process-payment', methods=['POST'])
 def process_payment():
@@ -638,6 +609,7 @@ def process_payment():
         return jsonify({"success": False, "message": f"Payment failure: {e}"}), 500
 
 
+# AI unlock endpoint (used by frontend triggerBillingTransaction)
 @app.route('/api/billing/ai-unlock', methods=['POST'])
 def ai_unlock():
     data = request.get_json() or {}
@@ -670,7 +642,7 @@ def ai_unlock():
 
 
 # =========================================================
-# 🪝 GATEWAY PRODUCTION WEBHOOKS
+# WEBHOOKS
 # =========================================================
 @app.route('/api/public/mpesa/callback', methods=['POST'])
 def mpesa_callback():
@@ -772,7 +744,7 @@ def stripe_webhook():
 
 
 # =========================================================
-# 📊 STATUS POLLERS
+# STATUS POLLERS
 # =========================================================
 @app.route('/api/payment/mpesa-status/<checkout_request_id>', methods=['GET'])
 def mpesa_status(checkout_request_id):
@@ -805,10 +777,11 @@ def stripe_status(session_id):
 
 
 # =========================================================
-# 🩺 METRICS & DIAGNOSTICS
+# DIAGNOSTICS
 # =========================================================
 @app.route('/api/diag/sms-test', methods=['POST'])
 def sms_test():
+    """POST {phone, code?} to verify Africa's Talking delivery end-to-end."""
     data = request.get_json() or {}
     phone = (data.get('phone') or '').strip()
     code = (data.get('code') or '123456').strip()
