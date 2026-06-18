@@ -123,49 +123,49 @@ def send_live_otp_sms(phone: str, otp_code: str):
         return False, f"SDK exception: {e}"
 
 app.config['SECRET_KEY'] = os.environ.get("FLASK_SECRET_KEY", "super-secret-fallback-key")
+
+  # =========================================================
+# 📧 EMAIL OTP DELIVERY (SENDGRID API)
 # =========================================================
-# 📧 EMAIL OTP DELIVERY (RESEND HTTP API)
-# =========================================================
-# This avoids Render Free Tier blocking ports 25/465/587 completely
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+# Make sure to update the default email below to the exact one you verified in SendGrid
+SENDGRID_SENDER_EMAIL = os.environ.get("SENDGRID_SENDER_EMAIL", "your-verified-email@gmail.com") 
 
 def send_live_otp_email(email: str, otp_code: str):
-    """Send OTP via Resend HTTP API on port 443. Returns (ok: bool, info: str)."""
-    if not RESEND_API_KEY:
-        logging.warning(f"⚠️ RESEND_API_KEY not configured. STUB OTP for {email}: {otp_code}")
-        return False, "Resend API key missing from environment"
+    """Send OTP via SendGrid API. Returns (ok: bool, info: str)."""
+    if not SENDGRID_API_KEY:
+        logging.warning(f"⚠️ SENDGRID_API_KEY not configured. STUB OTP for {email}: {otp_code}")
+        return False, "SendGrid API key missing from environment"
 
-    url = "https://api.resend.com/emails"
-    headers = {
-        "Authorization": f"Bearer {RESEND_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "from": "onboarding@resend.dev",  # Change to your verified domain later if desired
-        "to": email,
-        "subject": "Your Secure Portal Verification Code",
-        "html": (
+    # 1. Formulate the email
+    message = Mail(
+        from_email=SENDGRID_SENDER_EMAIL,
+        to_emails=email,
+        subject="Your Secure Portal Verification Code",
+        html_content=(
             f"<p>Your Wambui Shadrack & Associates secure portal verification code is: "
             f"<strong>{otp_code}</strong></p>"
             f"<p>This code expires in 10 minutes. If you did not request it, please ignore this email.</p>"
         )
-    }
+    )
 
+    # 2. Dispatch via SendGrid
     try:
-        # Requests over HTTPS (Port 443) are wide open on Render Free Tier
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
         
-        if response.status_code in (200, 201):
-            logging.info(f"✉️ OTP email successfully delivered via HTTP API to {email}")
-            return True, "Delivered via Resend HTTP API"
+        # SendGrid typically returns 202 ACCEPTED on success
+        if response.status_code in (200, 201, 202):
+            logging.info(f"✉️ OTP email successfully delivered via SendGrid to {email}")
+            return True, "Delivered via SendGrid API"
         else:
-            logging.error(f"❌ Resend API returned error code {response.status_code}: {response.text}")
-            return False, f"Resend error code {response.status_code}"
+            logging.error(f"❌ SendGrid returned error code {response.status_code}")
+            return False, f"SendGrid error code {response.status_code}"
             
     except Exception as e:
-        logging.error(f"❌ HTTP API request failed to {email}: {e}")
-        return False, f"HTTP request exception: {e}"
+        logging.error(f"❌ SendGrid request failed to {email}: {e}")
+        return False, f"SendGrid exception: {e}"  
+
 
 # =========================================================
 # 💰 M-PESA DARAJA (LIVE STK PUSH)
