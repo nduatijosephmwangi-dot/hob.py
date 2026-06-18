@@ -24,7 +24,11 @@ from flask_cors import CORS
 
 import stripe
 import africastalking
-
+import os
+import random
+import logging
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 # =========================================================
 # ⚙️ APP CONFIG
 # =========================================================
@@ -50,7 +54,7 @@ SYSTEM_STATE = {"LOCKDOWN_MODE": False}
 # =========================================================
 AT_USERNAME = os.environ.get("AT_USERNAME", "sandbox")
 AT_API_KEY = os.environ.get("AT_API_KEY", "")
-AT_SENDER_ID = os.environ.get("AT_SENDER_ID", "").strip() or None
+AT_SENDER_ID = os.environ.get("d-b5798a622212484f82c9af186054baaa" , "")
 
 sms_gateway = None
 try:
@@ -137,8 +141,8 @@ def send_live_otp_email(email: str, otp_code: str):
         logging.warning(f"⚠️ SENDGRID_API_KEY not configured. STUB OTP for {email}: {otp_code}")
         return False, "SendGrid API key missing from environment"
 
-    # 1. Formulate the email
-    message = Mail(
+    # 1. Formulate the Mail
+    message = email(
         from_email=SENDGRID_SENDER_EMAIL,
         to_emails=email,
         subject="Your Secure Portal Verification Code",
