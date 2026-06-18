@@ -142,7 +142,7 @@ def send_live_otp_email(email: str, otp_code: str):
         return False, "SendGrid API key missing from environment"
 
     # 1. Formulate the Mail
-    message = email(
+    message = Mail(
         from_email=SENDGRID_SENDER_EMAIL,
         to_emails=email,
         subject="Your Secure Portal Verification Code",
