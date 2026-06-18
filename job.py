@@ -124,41 +124,48 @@ def send_live_otp_sms(phone: str, otp_code: str):
 
 
 # =========================================================
-# 📧 EMAIL OTP DELIVERY (SMTP)
+# 📧 EMAIL OTP DELIVERY (RESEND HTTP API)
 # =========================================================
-SMTP_HOST = os.environ.get("SMTP_HOST", "")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASS = os.environ.get("SMTP_PASS", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "no-reply@wambuishadrack.local")
-
+# This avoids Render Free Tier blocking ports 25/465/587 completely
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 
 def send_live_otp_email(email: str, otp_code: str):
-    """Send OTP via SMTP. Returns (ok: bool, info: str)."""
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        logging.warning(f"⚠️ SMTP not configured. STUB OTP for {email}: {otp_code}")
-        return False, "SMTP credentials not configured"
-    try:
-        msg = MIMEText(
-            f"Your Wambui Shadrack & Associates secure portal verification code is: {otp_code}\n\n"
-            f"This code expires in 10 minutes. If you did not request it, please ignore this email."
+    """Send OTP via Resend HTTP API on port 443. Returns (ok: bool, info: str)."""
+    if not RESEND_API_KEY:
+        logging.warning(f"⚠️ RESEND_API_KEY not configured. STUB OTP for {email}: {otp_code}")
+        return False, "Resend API key missing from environment"
+
+    url = "https://api.resend.com/emails"
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "from": "onboarding@resend.dev",  # Change to your verified domain later if desired
+        "to": email,
+        "subject": "Your Secure Portal Verification Code",
+        "html": (
+            f"<p>Your Wambui Shadrack & Associates secure portal verification code is: "
+            f"<strong>{otp_code}</strong></p>"
+            f"<p>This code expires in 10 minutes. If you did not request it, please ignore this email.</p>"
         )
-        msg["Subject"] = "Your Secure Portal Verification Code"
-        msg["From"] = SMTP_FROM
-        msg["To"] = email
+    }
 
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-            server.ehlo()
-            server.starttls(context=ctx)
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_FROM, [email], msg.as_string())
-        logging.info(f"✉️ OTP email delivered to {email}")
-        return True, "Delivered via SMTP"
+    try:
+        # Requests over HTTPS (Port 443) are wide open on Render Free Tier
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        
+        if response.status_code in (200, 201):
+            logging.info(f"✉️ OTP email successfully delivered via HTTP API to {email}")
+            return True, "Delivered via Resend HTTP API"
+        else:
+            logging.error(f"❌ Resend API returned error code {response.status_code}: {response.text}")
+            return False, f"Resend error code {response.status_code}"
+            
     except Exception as e:
-        logging.error(f"❌ SMTP send failed to {email}: {e}")
-        return False, f"SMTP error: {e}"
-
+        logging.error(f"❌ HTTP API request failed to {email}: {e}")
+        return False, f"HTTP request exception: {e}"
 
 # =========================================================
 # 💰 M-PESA DARAJA (LIVE STK PUSH)
