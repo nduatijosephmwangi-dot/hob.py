@@ -122,7 +122,7 @@ def send_live_otp_sms(phone: str, otp_code: str):
         logging.error(f"❌ AT SDK exception sending to {e164}: {e}")
         return False, f"SDK exception: {e}"
 
-
+app.config['SECRET_KEY'] = os.environ.get("FLASK_SECRET_KEY", "super-secret-fallback-key")
 # =========================================================
 # 📧 EMAIL OTP DELIVERY (RESEND HTTP API)
 # =========================================================
