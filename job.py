@@ -465,203 +465,43 @@ def client_login(case_number):
 @app.route('/api/documents/client-upload', methods=['POST'])
 def client_upload():
     file = request.files.get('file')
-    case_number = (request.form.get('case_number') or '').strip()
-    if not file or not case_number:
-        return json_error("Missing file or case number.")
-    # Verify case exists
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT client_name FROM cases WHERE LOWER(case_number)=LOWER(%s)", (case_number,))
-    case = cur.fetchone()
-    if not case:
-        return json_error("Case not found.", 404)
+    # 1. Ask the frontend for an email instead of a case number
+    email = (request.form.get('email') or '').strip()
+    
+    if not file or not email:
+        return json_error("Missing file or email address.")
+        
     original = file.filename or 'upload.bin'
     safe = secure_filename(original)
     stamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    stored = f"{case_number.replace('/', '_')}__{stamp}__{safe}"
+    
+    # 2. Create a "General Inbox" tag using their email so the database accepts it
+    pseudo_case_number = f"INBOX-{email}"
+    stored = f"inbox_{stamp}__{safe}"
+    
     path = os.path.join(app.config['UPLOAD_FOLDER'], stored)
     file.save(path)
     size = os.path.getsize(path)
+    
+    conn = get_db(); cur = conn.cursor()
+    # 3. Save it to the database. The staff will see 'INBOX-their@email.com' in the case number column.
     cur.execute("""
         INSERT INTO case_documents
         (case_number, filename, original_name, file_size,
          uploaded_by_role, uploaded_by_name, visible_to_client)
         VALUES (%s,%s,%s,%s,'client',%s,TRUE)
         RETURNING doc_id
-    """, (case_number, stored, original, size, case['client_name']))
+    """, (pseudo_case_number, stored, original, size, email))
+    
     doc_id = cur.fetchone()['doc_id']
     conn.commit()
-    return jsonify({"success": True, "doc_id": doc_id, "filename": stored})
-@app.route('/api/staff/upload-document', methods=['POST'])
-@require_staff()
-def staff_upload():
-    file = request.files.get('file')
-    case_number = (request.form.get('case_number') or '').strip()
-    visible = (request.form.get('visible_to_client') or 'true').lower() == 'true'
-    if not file or not case_number:
-        return json_error("Missing file or case number.")
-    original = file.filename or 'upload.bin'
-    safe = secure_filename(original)
-    stamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    stored = f"{case_number.replace('/', '_')}__{stamp}__{safe}"
-    path = os.path.join(app.config['UPLOAD_FOLDER'], stored)
-    file.save(path)
-    size = os.path.getsize(path)
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO case_documents
-        (case_number, filename, original_name, file_size,
-         uploaded_by_role, uploaded_by_name, visible_to_client)
-        VALUES (%s,%s,%s,%s,'staff',%s,%s)
-        RETURNING doc_id
-    """, (case_number, stored, original, size, g.current_user['name'], visible))
-    doc_id = cur.fetchone()['doc_id']
-    conn.commit()
-    return jsonify({"success": True, "doc_id": doc_id, "filename": stored})
-@app.route('/api/documents/list', methods=['GET'])
-def list_docs():
-    case_number = (request.args.get('case_number') or '').strip()
-    # Staff (any role) sees all; client sees only visible_to_client for their case
-    email = _normalize_email(request.headers.get('X-User-Email', ''))
-    is_staff = False
-    if email:
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("SELECT role FROM users WHERE LOWER(email)=%s", (email,))
-        r = cur.fetchone()
-        is_staff = r and r['role'] in ('admin', 'advocate', 'secretary')
-    conn = get_db(); cur = conn.cursor()
-    if is_staff and not case_number:
-        cur.execute("""
-            SELECT * FROM case_documents ORDER BY upload_date DESC LIMIT 500
-        """)
-    elif is_staff:
-        cur.execute("""
-            SELECT * FROM case_documents WHERE LOWER(case_number)=LOWER(%s)
-            ORDER BY upload_date DESC
-        """, (case_number,))
-    else:
-        if not case_number:
-            return json_error("case_number required.", 400)
-        cur.execute("""
-            SELECT * FROM case_documents
-            WHERE LOWER(case_number)=LOWER(%s) AND visible_to_client=TRUE
-            ORDER BY upload_date DESC
-        """, (case_number,))
-    docs = cur.fetchall()
-    return jsonify({"success": True, "documents": docs})
-@app.route('/api/documents/download/<path:filename>', methods=['GET'])
-@require_staff()
-def staff_download(filename):
-    safe_name = secure_filename(filename)
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], safe_name)
-    if not os.path.exists(file_path):
-        return json_error("File not found.", 404)
-    return send_from_directory(
-        app.config['UPLOAD_FOLDER'], safe_name, as_attachment=True
-    )
-@app.route('/api/documents/<int:doc_id>', methods=['DELETE'])
-@require_staff()
-def delete_doc(doc_id):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT filename FROM case_documents WHERE doc_id=%s", (doc_id,))
-    row = cur.fetchone()
-    if not row:
-        return json_error("Document not found.", 404)
-    try:
-        os.remove(os.path.join(app.config['UPLOAD_FOLDER'], row['filename']))
-    except OSError:
-        pass
-    cur.execute("DELETE FROM case_documents WHERE doc_id=%s", (doc_id,))
-    conn.commit()
-    return jsonify({"success": True})
-# =========================================================
-# 📁 STAFF CASE CRUD
-# =========================================================
-@app.route('/api/staff/cases', methods=['GET'])
-@require_staff()
-def list_cases():
-    q = (request.args.get('q') or '').strip()
-    conn = get_db(); cur = conn.cursor()
-    if q:
-        like = f"%{q}%"
-        cur.execute("""
-            SELECT * FROM cases
-            WHERE case_number ILIKE %s OR case_parties ILIKE %s OR client_name ILIKE %s
-            ORDER BY updated_at DESC LIMIT 500
-        """, (like, like, like))
-    else:
-        cur.execute("SELECT * FROM cases ORDER BY updated_at DESC LIMIT 500")
-    rows = cur.fetchall()
-    # Hide finance for non-admin
-    if g.current_user['role'] != 'admin':
-        for r in rows:
-            r.pop('total_balance', None)
-            r.pop('paid_balance', None)
-    return jsonify({"success": True, "cases": rows})
-@app.route('/api/staff/cases', methods=['POST'])
-@require_staff()
-def create_case():
-    d = request.get_json(silent=True) or {}
-    case_number = (d.get('case_number') or '').strip()
-    if not case_number:
-        return json_error("case_number required.")
-    is_admin = g.current_user['role'] == 'admin'
-    conn = get_db(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO cases (case_number, case_parties, client_name, client_phone, client_email,
-                               next_court_date, coming_up_for, matter_notes,
-                               total_balance, paid_balance)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            RETURNING *
-        """, (
-            case_number,
-            d.get('case_parties'),
-            d.get('client_name'),
-            d.get('next_court_date'),
-            d.get('coming_up_for'),
-            d.get('matter_notes'),
-            float(d.get('total_balance') or 0) if is_admin else 0,
-            float(d.get('paid_balance') or 0) if is_admin else 0,
-        ))
-        case = cur.fetchone()
-        conn.commit()
-        return jsonify({"success": True, "case": case})
-    except psycopg2.IntegrityError:
-        conn.rollback()
-        return json_error("Case number already exists.", 409)
-@app.route('/api/staff/cases/<int:case_id>', methods=['PATCH'])
-@require_staff()
-def update_case(case_id):
-    d = request.get_json(silent=True) or {}
-    is_admin = g.current_user['role'] == 'admin'
-    # Whitelisted columns
-    editable = ['case_number', 'case_parties', 'client_name', 
-                'next_court_date', 'coming_up_for', 'matter_notes']
-    if is_admin:
-        editable += ['total_balance', 'paid_balance', 'ai_access_granted']
-    sets, vals = [], []
-    for k in editable:
-        if k in d:
-            sets.append(f"{k}=%s")
-            vals.append(d[k])
-    if not sets:
-        return json_error("No editable fields supplied.")
-    sets.append("updated_at=CURRENT_TIMESTAMP")
-    vals.append(case_id)
-    conn = get_db(); cur = conn.cursor()
-    cur.execute(f"UPDATE cases SET {', '.join(sets)} WHERE case_id=%s RETURNING *", vals)
-    row = cur.fetchone()
-    conn.commit()
-    if not row:
-        return json_error("Case not found.", 404)
-    return jsonify({"success": True, "case": row})
-@app.route('/api/staff/cases/<int:case_id>', methods=['DELETE'])
-@require_staff(roles=('admin',))
-def delete_case(case_id):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("DELETE FROM cases WHERE case_id=%s", (case_id,))
-    conn.commit()
-    return jsonify({"success": True})
+    
+    return jsonify({
+        "success": True, 
+        "doc_id": doc_id, 
+        "filename": stored,
+        "message": "Document delivered successfully!"
+    })
 # =========================================================
 # 🤖 AI — Constitution of Kenya + presidential precedents
 # =========================================================
