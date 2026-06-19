@@ -116,8 +116,6 @@ def init_db():
                 case_number VARCHAR(255) UNIQUE NOT NULL,
                 case_parties TEXT,
                 client_name VARCHAR(255),
-                client_phone VARCHAR(50),
-                client_email VARCHAR(255),
                 next_court_date VARCHAR(255),
                 coming_up_for TEXT,
                 matter_notes TEXT,
@@ -189,7 +187,7 @@ def init_db():
         """)
         # Seed staff
         seed_users = [
-            ('Shadrack Wambui', '0700260086', 'shadrack@wambuishadrack.co.ke', 'admin'),
+            ('Shadrack Wambui', '0700260086', 'shadrackwambu@gmail.com', 'admin'),
             ('Jeff Kangethe',   '0704704758', 'jeff@wambuishadrack.co.ke',     'advocate'),
             ('Jane Onyango',    '0795204923', 'jane@wambuishadrack.co.ke',     'secretary'),
         ]
@@ -449,8 +447,6 @@ def client_login(case_number):
                 "case_number": case['case_number'],
                 "case_parties": case['case_parties'],
                 "client_name": case['client_name'],
-                "client_phone": case['client_phone'],
-                "client_email": case['client_email'],
                 "next_court_date": str(case['next_court_date'] or ''),
                 "coming_up_for": case['coming_up_for'],
                 "financials": {"total": total, "paid": paid, "balance": total - paid},
@@ -610,7 +606,7 @@ def create_case():
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute("""
-            INSERT INTO cases (case_number, case_parties, client_name, client_phone, client_email,
+            INSERT INTO cases (case_number, case_parties, client_name, 
                                next_court_date, coming_up_for, matter_notes,
                                total_balance, paid_balance)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -619,8 +615,6 @@ def create_case():
             case_number,
             d.get('case_parties'),
             d.get('client_name'),
-            d.get('client_phone'),
-            d.get('client_email'),
             d.get('next_court_date'),
             d.get('coming_up_for'),
             d.get('matter_notes'),
@@ -639,7 +633,7 @@ def update_case(case_id):
     d = request.get_json(silent=True) or {}
     is_admin = g.current_user['role'] == 'admin'
     # Whitelisted columns
-    editable = ['case_number', 'case_parties', 'client_name', 'client_phone', 'client_email',
+    editable = ['case_number', 'case_parties', 'client_name', 
                 'next_court_date', 'coming_up_for', 'matter_notes']
     if is_admin:
         editable += ['total_balance', 'paid_balance', 'ai_access_granted']
@@ -692,22 +686,12 @@ def ai_consult():
     data = request.get_json(silent=True) or {}
     question = (data.get('question') or '').strip()
     actor = (data.get('actor') or 'client').lower()  # 'client' | 'staff' | 'admin'
-    case_number = (data.get('case_number') or '').strip()
-    user_name = (data.get('user_name') or '').strip()
     if not question:
         return json_error("Question cannot be blank.")
     # Client tier: require a valid case; premium requires paid AI unlock
-    if actor == 'client':
-        if not case_number:
-            return json_error("Case number required for client AI.", 400)
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("SELECT client_name, ai_access_granted FROM cases WHERE LOWER(case_number)=LOWER(%s)", (case_number,))
-        case = cur.fetchone()
-        if not case:
-            return json_error("Case not found.", 404)
-        # Free tier always allowed; flag premium quality
-        tone = "plain English, brief"
-    else:
+    
+    
+        
         tone = "advocate-grade with full citations"
     if not LOVABLE_API_KEY:
         # Graceful fallback so the portal still works in dev
@@ -728,7 +712,7 @@ def ai_consult():
                 json={
                     "model": AI_MODEL,
                     "messages": [
-                        {"role": "system", "content": LEGAL_SYSTEM_PROMPT + f"\nAnswer in {tone}."},
+                        {"role": "system", "content": LEGAL_SYSTEM_PROMPT + f"\nAnswer in ."},
                         {"role": "user", "content": question},
                     ],
                     "temperature": 0.3,
@@ -750,7 +734,7 @@ def ai_consult():
         cur.execute("""
             INSERT INTO ai_client_logs (case_number, client_name, actor, question, ai_response)
             VALUES (%s,%s,%s,%s,%s)
-        """, (case_number or None, user_name or None, actor, question, answer))
+        """, ( actor, question, answer))
         conn.commit()
     except Exception:
         pass
