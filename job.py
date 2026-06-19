@@ -116,6 +116,8 @@ def init_db():
                 case_number VARCHAR(255) UNIQUE NOT NULL,
                 case_parties TEXT,
                 client_name VARCHAR(255),
+                client_phone VARCHAR(50),
+                client_email VARCHAR(255),
                 next_court_date VARCHAR(255),
                 coming_up_for TEXT,
                 matter_notes TEXT,
@@ -187,7 +189,7 @@ def init_db():
         """)
         # Seed staff
         seed_users = [
-            ('Shadrack Wambui', '0700260086', 'shadrackwambu@gmail.com', 'admin'),
+            ('Shadrack Wambui', '0700260086', 'shadrack@wambuishadrack.co.ke', 'admin'),
             ('Jeff Kangethe',   '0704704758', 'jeff@wambuishadrack.co.ke',     'advocate'),
             ('Jane Onyango',    '0795204923', 'jane@wambuishadrack.co.ke',     'secretary'),
         ]
@@ -427,7 +429,7 @@ def client_login(case_number):
     try:
         conn = get_db(); cur = conn.cursor()
         cur.execute("""
-            SELECT case_id, case_number, case_parties, client_name, client_phone, client_email,
+            SELECT case_id, case_number, case_parties, client_name,
                    ai_access_granted, next_court_date, coming_up_for,
                    total_balance, paid_balance
             FROM cases WHERE LOWER(case_number) = LOWER(%s)
@@ -606,7 +608,7 @@ def create_case():
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute("""
-            INSERT INTO cases (case_number, case_parties, client_name, 
+            INSERT INTO cases (case_number, case_parties, client_name, client_phone, client_email,
                                next_court_date, coming_up_for, matter_notes,
                                total_balance, paid_balance)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -686,12 +688,15 @@ def ai_consult():
     data = request.get_json(silent=True) or {}
     question = (data.get('question') or '').strip()
     actor = (data.get('actor') or 'client').lower()  # 'client' | 'staff' | 'admin'
+    case_number = (data.get('case_number') or '').strip()
+    user_name = (data.get('user_name') or '').strip()
     if not question:
         return json_error("Question cannot be blank.")
     # Client tier: require a valid case; premium requires paid AI unlock
     
-    
-        
+        # Free tier always allowed; flag premium quality
+        tone = "plain English, brief"
+    else:
         tone = "advocate-grade with full citations"
     if not LOVABLE_API_KEY:
         # Graceful fallback so the portal still works in dev
@@ -712,7 +717,7 @@ def ai_consult():
                 json={
                     "model": AI_MODEL,
                     "messages": [
-                        {"role": "system", "content": LEGAL_SYSTEM_PROMPT + f"\nAnswer in ."},
+                        {"role": "system", "content": LEGAL_SYSTEM_PROMPT + f"\nAnswer in {tone}."},
                         {"role": "user", "content": question},
                     ],
                     "temperature": 0.3,
@@ -734,7 +739,7 @@ def ai_consult():
         cur.execute("""
             INSERT INTO ai_client_logs (case_number, client_name, actor, question, ai_response)
             VALUES (%s,%s,%s,%s,%s)
-        """, ( actor, question, answer))
+        """, (case_number or None, user_name or None, actor, question, answer))
         conn.commit()
     except Exception:
         pass
