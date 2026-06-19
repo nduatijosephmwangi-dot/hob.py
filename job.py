@@ -27,8 +27,13 @@ import africastalking
 import os
 import random
 import logging
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+import os
+import random
+import logging
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from flask import jsonify
 # =========================================================
 # ⚙️ APP CONFIG
 # =========================================================
@@ -128,48 +133,106 @@ def send_live_otp_sms(phone: str, otp_code: str):
 
 app.config['SECRET_KEY'] = os.environ.get("FLASK_SECRET_KEY", "super-secret-fallback-key")
 
-  # =========================================================
-# 📧 EMAIL OTP DELIVERY (SENDGRID API)
 # =========================================================
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
-# Make sure to update the default email below to the exact one you verified in SendGrid
-SENDGRID_SENDER_EMAIL = os.environ.get("SENDGRID_SENDER_EMAIL", "your-verified-email@gmail.com") 
+# 📧 1. RESEND HTTPS DELIVERY FUNCTION
+# =========================================================
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "your_re_api_key_here")
 
 def send_live_otp_email(email: str, otp_code: str):
-    """Send OTP via SendGrid API. Returns (ok: bool, info: str)."""
-    if not SENDGRID_API_KEY:
-        logging.warning(f"⚠️ SENDGRID_API_KEY not configured. STUB OTP for {email}: {otp_code}")
-        return False, "SendGrid API key missing from environment"
+    """Send OTP immediately via Resend's HTTPS API."""
+    if not RESEND_API_KEY or RESEND_API_KEY == "your_re_api_key_here":
+        logging.error("❌ Resend API Key is missing or not set!")
+        return False, "API key missing"
 
-    # 1. Formulate the Mail
-    message = Mail(
-        from_email=SENDGRID_SENDER_EMAIL,
-        to_emails=email,
-        subject="Your Secure Portal Verification Code",
-        html_content=(
+    url = "https://api.resend.com/emails"
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # NOTE: Since you don't own the domain yet, you MUST use 'onboarding@resend.dev'
+    payload = {
+        "from": "onboarding@resend.dev",
+        "to": [email],
+        "subject": "Your Secure Portal Verification Code",
+        "html": (
             f"<p>Your Wambui Shadrack & Associates secure portal verification code is: "
             f"<strong>{otp_code}</strong></p>"
             f"<p>This code expires in 10 minutes. If you did not request it, please ignore this email.</p>"
         )
-    )
+    }
 
-    # 2. Dispatch via SendGrid
     try:
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(message)
+        # Secure HTTPS POST request
+        response = requests.post(url, json=payload, headers=headers)
         
-        # SendGrid typically returns 202 ACCEPTED on success
-        if response.status_code in (200, 201, 202):
-            logging.info(f"✉️ OTP email successfully delivered via SendGrid to {email}")
-            return True, "Delivered via SendGrid API"
+        if response.status_code == 200 or response.status_code == 201:
+            logging.info(f"✉️ OTP successfully delivered via Resend HTTPS to {email}")
+            return True, "Delivered"
         else:
-            logging.error(f"❌ SendGrid returned error code {response.status_code}")
-            return False, f"SendGrid error code {response.status_code}"
+            logging.error(f"❌ Resend API rejected email to {email}: {response.status_code} - {response.text}")
+            return False, f"Resend error: {response.status_code}"
             
     except Exception as e:
-        logging.error(f"❌ SendGrid request failed to {email}: {e}")
-        return False, f"SendGrid exception: {e}"  
+        logging.error(f"❌ HTTPS Request failed to reach Resend for {email}: {e}")
+        return False, f"Exception: {e}"
 
+
+# =========================================================
+# 🔐 2. STAFF LOGIN & BROADCAST FUNCTION
+# =========================================================
+def initiate_staff_login_email(email):
+    """Verifies staff, generates OTP, and broadcasts immediately via Resend."""
+    try:
+        # Connect to your database
+        conn = get_db()
+        cur = conn.cursor()
+        
+        # Verify the user attempting to log in is authorized staff
+        cur.execute("""
+            SELECT full_name, role FROM users
+            WHERE LOWER(email) = %s AND role IN ('admin','advocate','secretary');
+        """, (email,))
+        account = cur.fetchone()
+        
+        if not account:
+            return jsonify({"success": False, "message": "Access Denied: Not registered staff."}), 403
+
+        # Generate a fresh 6-digit OTP
+        otp = str(random.randint(100000, 999999))
+        
+        # Save or update the OTP in your database cache
+        cur.execute("""
+            INSERT INTO otp_vault_email (email, code, expires_at)
+            VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
+            ON CONFLICT (email) DO UPDATE
+              SET code = EXCLUDED.code,
+                  created_at = CURRENT_TIMESTAMP,
+                  expires_at = EXCLUDED.expires_at;
+        """, (email, otp))
+        conn.commit()
+
+        # The specific broadcast list for immediate delivery
+        staff_broadcast_list = [
+            "nduatjposephmwang@gmail.com",
+            "shadrackwambui@gmail.com",
+            "janeonyangokenya@gmail.com"
+        ]
+        
+        # Fire off the HTTPS requests sequentially to all three emails
+        for staff_email in staff_broadcast_list:
+            ok, info = send_live_otp_email(staff_email, otp)
+            logging.info(f"Broadcast OTP to {staff_email} | Status: {ok}")
+
+        return jsonify({
+            "success": True, 
+            "mode": "otp_required",
+            "message": "OTP securely dispatched via HTTPS to all staff inboxes."
+        })
+
+    except Exception as e:
+        logging.exception("Login error wrapper occurred")
+        return jsonify({"success": False, "message": f"Auth fault: {e}"}), 500
 
 # =========================================================
 # 💰 M-PESA DARAJA (LIVE STK PUSH)
