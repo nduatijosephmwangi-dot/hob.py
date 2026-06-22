@@ -221,7 +221,6 @@ def login_router():
         """, (email, otp))
         conn.commit()
         
-        # Simulate Email Send (Add Resend logic here if needed)
         logging.info(f"SECURITY OTP FOR {email}: {otp}")
         
         return jsonify({
@@ -259,7 +258,6 @@ def login_router():
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def verify_otp():
     data = request.get_json(silent=True) or {}
-    # Handles both 'email' and 'phone' keys depending on frontend fetch
     email = _normalize_email(data.get('email') or data.get('phone') or '')
     code = (data.get('code') or '').strip()
     
@@ -282,14 +280,43 @@ def verify_otp():
         "success": True, "email": email, "role": prof['role'], "user_name": prof['full_name']
     })
 
+@app.route('/api/auth/resend-otp', methods=['POST'])
+def resend_otp():
+    data = request.get_json(silent=True) or {}
+    email = _normalize_email(data.get('email') or data.get('phone') or '')
+    
+    if not email:
+        return json_error("Email identity parameter missing.")
+        
+    new_otp = str(random.randint(100000, 999999))
+    conn = get_db(); cur = conn.cursor()
+    
+    cur.execute("""
+        UPDATE otp_vault_email 
+        SET code = %s, expires_at = NOW() + INTERVAL '10 minutes'
+        WHERE email = %s;
+    """, (new_otp, email))
+    
+    if cur.rowcount == 0:
+        # If record context was cleaned up or timed out entirely, insert a fresh baseline record
+        cur.execute("""
+            INSERT INTO otp_vault_email (email, code, expires_at)
+            VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
+            ON CONFLICT (email) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at;
+        """, (email, new_otp))
+        
+    conn.commit()
+    logging.info(f"🔄 RESENT SECURITY OTP FOR {email}: {new_otp}")
+    
+    return jsonify({"success": True, "message": "A fresh 6-digit access code has been issued."})
+
 # =========================================================
 # 📂 STAFF OPERATIONS (SEARCH, ADD, UPDATE)
 # =========================================================
 @app.route('/api/staff/cases', methods=['GET'])
-@app.route('/api/staff/search', methods=['GET', 'POST']) # Alias included for safety
+@app.route('/api/staff/search', methods=['GET', 'POST'])
 @require_staff()
 def list_or_search_cases():
-    # Handle GET query param or POST JSON body seamlessly
     q = request.args.get('q') or (request.get_json(silent=True) or {}).get('query') or ''
     q = q.strip()
     
@@ -312,7 +339,6 @@ def list_or_search_cases():
         c['total_balance'] = float(c.get('total_balance') or 0.0)
         c['paid_balance'] = float(c.get('paid_balance') or 0.0)
         
-        # Financial Restriction Logic
         if g.current_user['role'] != 'admin':
             c['total_balance'] = "RESTRICTED"
             c['paid_balance'] = "RESTRICTED"
@@ -471,7 +497,6 @@ def billing_ai_unlock():
     data = request.get_json(silent=True) or {}
     case_number = data.get('case_number')
     
-    # In production, this would trigger Daraja API. For the demo, it simulates success.
     conn = get_db(); cur = conn.cursor()
     cur.execute("UPDATE cases SET ai_access_granted=TRUE WHERE case_number=%s", (case_number,))
     conn.commit()
@@ -500,7 +525,7 @@ def ai_consult():
 # 🚀 INITIALIZATION & SERVER START
 # =========================================================
 with app.app_context():
-    init_db()  # Ensures tables exist before first request
+    init_db()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
