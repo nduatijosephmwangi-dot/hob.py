@@ -6,14 +6,6 @@
 =====================================================================
 DEPLOY (Render):
   Start command:  gunicorn -w 2 -k gthread --threads 8 -t 120 app:app
-  Env vars needed:
-    DATABASE_URL, FRONTEND_URL, FLASK_SECRET_KEY,
-    RESEND_API_KEY, RESEND_FROM (optional, default onboarding@resend.dev),
-    MPESA_ENV, MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET,
-    MPESA_SHORTCODE, MPESA_PASSKEY, MPESA_CALLBACK_URL,
-    STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
-    STRIPE_SUCCESS_URL, STRIPE_CANCEL_URL, STRIPE_CURRENCY,
-    LOVABLE_API_KEY  (for /api/ai/consult grounded responses)
 """
 import os
 import random
@@ -34,16 +26,15 @@ from flask import (
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import stripe
+
 # =========================================================
 # ⚙️ APP CONFIG
 # =========================================================
 app = Flask(__name__)
-# CORS — allow your Lovable preview, published, and any custom domain
-frontend_origins = os.environ.get(
-    "FRONTEND_URL",
-    "*"
-).split(",")
+
+frontend_origins = os.environ.get("FRONTEND_URL", "*").split(",")
 CORS(app, resources={r"/api/*": {"origins": frontend_origins, "supports_credentials": False}})
+
 app.config['DATABASE_URL'] = os.environ.get(
     'DATABASE_URL',
     'dbname=postgres user=postgres password=jose1023 host=localhost port=5432'
@@ -51,15 +42,15 @@ app.config['DATABASE_URL'] = os.environ.get(
 app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', './client_docs/')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB upload cap
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s'
-)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 SYSTEM_STATE = {"LOCKDOWN_MODE": False}
+
 # =========================================================
-# 🗄️ DATABASE — Connection Pool (fixes slow responses)
+# 🗄️ DATABASE — Connection Pool
 # =========================================================
 DB_POOL = None
+
 def init_pool():
     global DB_POOL
     if DB_POOL is None:
@@ -69,12 +60,14 @@ def init_pool():
             cursor_factory=RealDictCursor
         )
         logging.info("✅ DB pool initialized")
+
 def get_db():
     if 'db' not in g:
         if DB_POOL is None:
             init_pool()
         g.db = DB_POOL.getconn()
     return g.db
+
 @app.teardown_appcontext
 def close_db(_e=None):
     db = g.pop('db', None)
@@ -84,6 +77,7 @@ def close_db(_e=None):
         except Exception:
             pass
         DB_POOL.putconn(db)
+
 # =========================================================
 # 🛠️ DB SCHEMA + SEED
 # =========================================================
@@ -130,7 +124,7 @@ def init_db():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_cases_number ON cases (case_number);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_cases_number_lower ON cases (LOWER(case_number));")
-        # Unified documents table: who uploaded (client/staff), visible-to-client flag
+        
         cur.execute("""
             CREATE TABLE IF NOT EXISTS case_documents (
                 doc_id SERIAL PRIMARY KEY,
@@ -138,19 +132,20 @@ def init_db():
                 filename VARCHAR(500) NOT NULL,
                 original_name VARCHAR(500),
                 file_size BIGINT,
-                uploaded_by_role VARCHAR(50) NOT NULL,  -- 'client' | 'staff'
+                uploaded_by_role VARCHAR(50) NOT NULL,
                 uploaded_by_name VARCHAR(255),
                 visible_to_client BOOLEAN DEFAULT TRUE,
                 upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_case ON case_documents (case_number);")
+        
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ai_client_logs (
                 log_id SERIAL PRIMARY KEY,
                 case_number VARCHAR(255),
                 client_name VARCHAR(255),
-                actor VARCHAR(50),   -- 'client' | 'staff' | 'admin'
+                actor VARCHAR(50),
                 question TEXT NOT NULL,
                 ai_response TEXT NOT NULL,
                 logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -162,7 +157,7 @@ def init_db():
                 case_number VARCHAR(255),
                 phone_number VARCHAR(50),
                 amount NUMERIC(15,2),
-                purpose VARCHAR(50) DEFAULT 'balance',  -- 'balance' | 'ai_unlock'
+                purpose VARCHAR(50) DEFAULT 'balance',
                 merchant_request_id VARCHAR(255),
                 checkout_request_id VARCHAR(255) UNIQUE,
                 mpesa_receipt VARCHAR(255),
@@ -187,7 +182,7 @@ def init_db():
                 completed_at TIMESTAMP
             );
         """)
-        # Seed staff
+        
         seed_users = [
             ('Shadrack Wambui', '0700260086', 'shadrack@wambuishadrack.co.ke', 'admin'),
             ('Jeff Kangethe',   '0704704758', 'jeff@wambuishadrack.co.ke',     'advocate'),
@@ -207,6 +202,7 @@ def init_db():
         logging.exception(f"DB init failure: {e}")
     finally:
         DB_POOL.putconn(conn)
+
 # =========================================================
 # 🔑 HELPERS
 # =========================================================
@@ -217,17 +213,21 @@ def _normalize_phone(phone: str) -> str:
     elif p.startswith('7') and len(p) == 9:
         p = '254' + p
     return p
+
 def _normalize_email(value: str) -> str:
     return (value or '').strip().lower()
+
 def json_error(msg, code=400, **extra):
     payload = {"success": False, "message": msg}
     payload.update(extra)
     return jsonify(payload), code
+
 # =========================================================
 # 📧 RESEND EMAIL (OTP)
 # =========================================================
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM = os.environ.get("RESEND_FROM", "onboarding@resend.dev")
+
 def send_otp_email(email: str, otp: str, name: str = ""):
     if not RESEND_API_KEY:
         logging.warning(f"📭 STUB email to {email}: OTP={otp}")
@@ -263,6 +263,7 @@ def send_otp_email(email: str, otp: str, name: str = ""):
         return False, f"Resend {r.status_code}: {r.text[:200]}"
     except Exception as e:
         return False, f"Email exception: {e}"
+
 # =========================================================
 # 💰 M-PESA DARAJA
 # =========================================================
@@ -274,6 +275,7 @@ MPESA_PASSKEY = os.environ.get('MPESA_PASSKEY', '')
 MPESA_CALLBACK_URL = os.environ.get('MPESA_CALLBACK_URL', '')
 MPESA_TRANSACTION_TYPE = os.environ.get('MPESA_TRANSACTION_TYPE', 'CustomerPayBillOnline')
 MPESA_BASE = 'https://api.safaricom.co.ke' if MPESA_ENV == 'production' else 'https://sandbox.safaricom.co.ke'
+
 def get_mpesa_token():
     if not MPESA_CONSUMER_KEY or not MPESA_CONSUMER_SECRET:
         raise RuntimeError("M-Pesa credentials not configured.")
@@ -287,6 +289,7 @@ def get_mpesa_token():
     if not tok:
         raise RuntimeError(f"Daraja token error: {r.text}")
     return tok
+
 def initiate_stk_push(phone, amount, account_ref, description="Legal Fees"):
     token = get_mpesa_token()
     ts = datetime.now().strftime('%Y%m%d%H%M%S')
@@ -318,6 +321,7 @@ def initiate_stk_push(phone, amount, account_ref, description="Legal Fees"):
         data = {"raw": r.text}
     logging.info(f"STK ({r.status_code}): {data}")
     return r.status_code, data
+
 # =========================================================
 # 💳 STRIPE
 # =========================================================
@@ -326,8 +330,9 @@ STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 STRIPE_SUCCESS_URL = os.environ.get('STRIPE_SUCCESS_URL', 'https://example.com/success')
 STRIPE_CANCEL_URL = os.environ.get('STRIPE_CANCEL_URL', 'https://example.com/cancel')
 STRIPE_CURRENCY = os.environ.get('STRIPE_CURRENCY', 'kes').lower()
+
 # =========================================================
-# 🛡️ ROLE-CHECK MIDDLEWARE (simple header-based)
+# 🛡️ ROLE-CHECK MIDDLEWARE
 # =========================================================
 def require_staff(roles=('admin', 'advocate', 'secretary')):
     def deco(fn):
@@ -345,14 +350,16 @@ def require_staff(roles=('admin', 'advocate', 'secretary')):
             return fn(*args, **kwargs)
         return wrapper
     return deco
+
 # =========================================================
-# 🩺 HEALTH / WARMUP
+# 🩺 HEALTH
 # =========================================================
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({"ok": True, "ts": datetime.utcnow().isoformat()})
+
 # =========================================================
-# 🔐 AUTH — Smart login router
+# 🔐 AUTH
 # =========================================================
 @app.route('/api/auth/login-router', methods=['POST'])
 def login_router():
@@ -363,6 +370,7 @@ def login_router():
     if '@' in credential:
         return initiate_staff_login(_normalize_email(credential))
     return client_login(credential)
+
 def initiate_staff_login(email):
     try:
         conn = get_db(); cur = conn.cursor()
@@ -394,6 +402,7 @@ def initiate_staff_login(email):
     except Exception as e:
         logging.exception("Staff login error")
         return json_error(f"Auth fault: {e}", 500)
+
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def verify_otp():
     data = request.get_json(silent=True) or {}
@@ -419,12 +428,13 @@ def verify_otp():
         return jsonify({
             "success": True,
             "email": email,
-            "role": prof['role'],   # 'admin' | 'advocate' | 'secretary'
+            "role": prof['role'],
             "user_name": prof['full_name'],
         })
     except Exception as e:
         logging.exception("verify error")
         return json_error(f"Vault read error: {e}", 500)
+
 def client_login(case_number):
     try:
         conn = get_db(); cur = conn.cursor()
@@ -459,93 +469,256 @@ def client_login(case_number):
     except Exception as e:
         logging.exception("client login")
         return json_error(f"DB failure: {e}", 500)
+
 # =========================================================
-# 📂 DOCUMENTS — Client upload + Staff/Admin list & download
+# 📂 DOCUMENTS
 # =========================================================
 @app.route('/api/documents/client-upload', methods=['POST'])
 def client_upload():
     file = request.files.get('file')
-    # 1. Ask the frontend for an email instead of a case number
-    email = (request.form.get('email') or '').strip()
-    
-    if not file or not email:
-        return json_error("Missing file or email address.")
-        
+    case_number = (request.form.get('case_number') or '').strip()
+    if not file or not case_number:
+        return json_error("Missing file or case number.")
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT client_name FROM cases WHERE LOWER(case_number)=LOWER(%s)", (case_number,))
+    case = cur.fetchone()
+    if not case:
+        return json_error("Case not found.", 404)
     original = file.filename or 'upload.bin'
     safe = secure_filename(original)
     stamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    
-    # 2. Create a "General Inbox" tag using their email so the database accepts it
-    pseudo_case_number = f"INBOX-{email}"
-    stored = f"inbox_{stamp}__{safe}"
-    
+    stored = f"{case_number.replace('/', '_')}__{stamp}__{safe}"
     path = os.path.join(app.config['UPLOAD_FOLDER'], stored)
     file.save(path)
     size = os.path.getsize(path)
-    
-    conn = get_db(); cur = conn.cursor()
-    # 3. Save it to the database. The staff will see 'INBOX-their@email.com' in the case number column.
     cur.execute("""
         INSERT INTO case_documents
         (case_number, filename, original_name, file_size,
          uploaded_by_role, uploaded_by_name, visible_to_client)
         VALUES (%s,%s,%s,%s,'client',%s,TRUE)
         RETURNING doc_id
-    """, (pseudo_case_number, stored, original, size, email))
-    
+    """, (case_number, stored, original, size, case['client_name']))
     doc_id = cur.fetchone()['doc_id']
     conn.commit()
-    
-    return jsonify({
-        "success": True, 
-        "doc_id": doc_id, 
-        "filename": stored,
-        "message": "Document delivered successfully!"
-    })
+    return jsonify({"success": True, "doc_id": doc_id, "filename": stored})
+
+@app.route('/api/staff/upload-document', methods=['POST'])
+@require_staff()
+def staff_upload():
+    file = request.files.get('file')
+    case_number = (request.form.get('case_number') or '').strip()
+    visible = (request.form.get('visible_to_client') or 'true').lower() == 'true'
+    if not file or not case_number:
+        return json_error("Missing file or case number.")
+    original = file.filename or 'upload.bin'
+    safe = secure_filename(original)
+    stamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    stored = f"{case_number.replace('/', '_')}__{stamp}__{safe}"
+    path = os.path.join(app.config['UPLOAD_FOLDER'], stored)
+    file.save(path)
+    size = os.path.getsize(path)
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO case_documents
+        (case_number, filename, original_name, file_size,
+         uploaded_by_role, uploaded_by_name, visible_to_client)
+        VALUES (%s,%s,%s,%s,'staff',%s,%s)
+        RETURNING doc_id
+    """, (case_number, stored, original, size, g.current_user['name'], visible))
+    doc_id = cur.fetchone()['doc_id']
+    conn.commit()
+    return jsonify({"success": True, "doc_id": doc_id, "filename": stored})
+
+@app.route('/api/documents/list', methods=['GET'])
+def list_docs():
+    case_number = (request.args.get('case_number') or '').strip()
+    email = _normalize_email(request.headers.get('X-User-Email', ''))
+    is_staff = False
+    if email:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT role FROM users WHERE LOWER(email)=%s", (email,))
+        r = cur.fetchone()
+        is_staff = r and r['role'] in ('admin', 'advocate', 'secretary')
+    conn = get_db(); cur = conn.cursor()
+    if is_staff and not case_number:
+        cur.execute("SELECT * FROM case_documents ORDER BY upload_date DESC LIMIT 500")
+    elif is_staff:
+        cur.execute("""
+            SELECT * FROM case_documents WHERE LOWER(case_number)=LOWER(%s)
+            ORDER BY upload_date DESC
+        """, (case_number,))
+    else:
+        if not case_number:
+            return json_error("case_number required.", 400)
+        cur.execute("""
+            SELECT * FROM case_documents
+            WHERE LOWER(case_number)=LOWER(%s) AND visible_to_client=TRUE
+            ORDER BY upload_date DESC
+        """, (case_number,))
+    docs = cur.fetchall()
+    return jsonify({"success": True, "documents": docs})
+
+@app.route('/api/documents/download/<path:filename>', methods=['GET'])
+@require_staff()
+def staff_download(filename):
+    safe_name = secure_filename(filename)
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], safe_name)
+    if not os.path.exists(file_path):
+        return json_error("File not found.", 404)
+    return send_from_directory(app.config['UPLOAD_FOLDER'], safe_name, as_attachment=True)
+
+@app.route('/api/documents/<int:doc_id>', methods=['DELETE'])
+@require_staff()
+def delete_doc(doc_id):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT filename FROM case_documents WHERE doc_id=%s", (doc_id,))
+    row = cur.fetchone()
+    if not row:
+        return json_error("Document not found.", 404)
+    try:
+        os.remove(os.path.join(app.config['UPLOAD_FOLDER'], row['filename']))
+    except OSError:
+        pass
+    cur.execute("DELETE FROM case_documents WHERE doc_id=%s", (doc_id,))
+    conn.commit()
+    return jsonify({"success": True})
+
 # =========================================================
-# 🤖 AI — Constitution of Kenya + presidential precedents
+# 📁 STAFF CASE CRUD
+# =========================================================
+@app.route('/api/staff/cases', methods=['GET'])
+@require_staff()
+def list_cases():
+    q = (request.args.get('q') or '').strip()
+    conn = get_db(); cur = conn.cursor()
+    
+    if q:
+        like = f"%{q}%"
+        cur.execute("""
+            SELECT * FROM cases
+            WHERE case_number ILIKE %s OR case_parties ILIKE %s OR client_name ILIKE %s
+            ORDER BY updated_at DESC LIMIT 500
+        """, (like, like, like))
+    else:
+        cur.execute("SELECT * FROM cases ORDER BY updated_at DESC LIMIT 500")
+        
+    raw_rows = cur.fetchall()
+    clean_rows = []
+    
+    for r in raw_rows:
+        case_dict = dict(r)
+        # Fix the decimal parsing issue
+        case_dict['total_balance'] = float(case_dict.get('total_balance') or 0.0)
+        case_dict['paid_balance'] = float(case_dict.get('paid_balance') or 0.0)
+        
+        if g.current_user['role'] != 'admin':
+            case_dict.pop('total_balance', None)
+            case_dict.pop('paid_balance', None)
+            
+        clean_rows.append(case_dict)
+        
+    return jsonify({"success": True, "cases": clean_rows})
+
+@app.route('/api/staff/cases', methods=['POST'])
+@require_staff()
+def create_case():
+    d = request.get_json(silent=True) or {}
+    case_number = (d.get('case_number') or '').strip()
+    if not case_number:
+        return json_error("case_number required.")
+    is_admin = g.current_user['role'] == 'admin'
+    conn = get_db(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO cases (case_number, case_parties, client_name, client_phone, client_email,
+                               next_court_date, coming_up_for, matter_notes,
+                               total_balance, paid_balance)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING *
+        """, (
+            case_number,
+            d.get('case_parties'),
+            d.get('client_name'),
+            d.get('client_phone'),
+            d.get('client_email'),
+            d.get('next_court_date'),
+            d.get('coming_up_for'),
+            d.get('matter_notes'),
+            float(d.get('total_balance') or 0) if is_admin else 0,
+            float(d.get('paid_balance') or 0) if is_admin else 0,
+        ))
+        case = cur.fetchone()
+        conn.commit()
+        return jsonify({"success": True, "case": case})
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        return json_error("Case number already exists.", 409)
+
+@app.route('/api/staff/cases/<int:case_id>', methods=['PATCH'])
+@require_staff()
+def update_case(case_id):
+    d = request.get_json(silent=True) or {}
+    is_admin = g.current_user['role'] == 'admin'
+    editable = ['case_number', 'case_parties', 'client_name', 
+                'next_court_date', 'coming_up_for', 'matter_notes']
+    if is_admin:
+        editable += ['total_balance', 'paid_balance', 'ai_access_granted']
+    sets, vals = [], []
+    for k in editable:
+        if k in d:
+            sets.append(f"{k}=%s")
+            vals.append(d[k])
+    if not sets:
+        return json_error("No editable fields supplied.")
+    sets.append("updated_at=CURRENT_TIMESTAMP")
+    vals.append(case_id)
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(f"UPDATE cases SET {', '.join(sets)} WHERE case_id=%s RETURNING *", vals)
+    row = cur.fetchone()
+    conn.commit()
+    if not row:
+        return json_error("Case not found.", 404)
+    return jsonify({"success": True, "case": row})
+
+@app.route('/api/staff/search/<int:case_id>', methods=['DELETE'])
+@require_staff(roles=('admin',))
+def delete_case(case_id):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM cases WHERE case_id=%s", (case_id,))
+    conn.commit()
+    return list_cases()
+    return jsonify({"success": True})
+
+# =========================================================
+# 🤖 AI
 # =========================================================
 LOVABLE_API_KEY = os.environ.get('LOVABLE_API_KEY', '')
 AI_MODEL = os.environ.get('AI_MODEL', 'google/gemini-2.5-flash')
 LEGAL_SYSTEM_PROMPT = """You are a Kenyan legal research assistant for Wambui Shadrack & Associates Advocates.
 GROUNDING RULES (strict):
-1. Base every answer on the Constitution of Kenya, 2010 — cite the exact Chapter and Article (e.g. "Article 47 — fair administrative action").
-2. Reference Kenyan landmark presidential election petitions where relevant:
-   - Raila Odinga & Others v IEBC & Others [2013] eKLR (Petition No. 5 of 2013)
-   - Raila Odinga & Another v IEBC & Others [2017] eKLR (Petition No. 1 of 2017) — nullification of the presidential election
-   - Raila Odinga & Another v IEBC & Others [2017] eKLR (Petition No. 2 of 2017)
-   - Raila Odinga v IEBC & Others [2022] eKLR (Petition No. E005 of 2022)
-3. Use this 4-part structure:
-   ISSUE: One-sentence statement of the legal issue.
-   LAW: Constitutional articles + statutes + cited cases.
-   APPLICATION: How the law applies to the facts.
-   CONCLUSION: Recommended legal position / strategy.
-4. If the question is outside Kenyan law, say so and refuse to speculate.
-5. For clients, write in plain English. For staff/admin, write in advocate-grade language with full citations.
+1. Base every answer on the Constitution of Kenya, 2010.
+2. Reference Kenyan landmark presidential election petitions where relevant.
+3. Use 4-part structure: ISSUE, LAW, APPLICATION, CONCLUSION.
 """
+
 @app.route('/api/ai/consult', methods=['POST'])
 def ai_consult():
     data = request.get_json(silent=True) or {}
     question = (data.get('question') or '').strip()
-    actor = (data.get('actor') or 'client').lower()  # 'client' | 'staff' | 'admin'
+    actor = (data.get('actor') or 'client').lower()
     case_number = (data.get('case_number') or '').strip()
     user_name = (data.get('user_name') or '').strip()
+    
     if not question:
         return json_error("Question cannot be blank.")
-    # Client tier: require a valid case; premium requires paid AI unlock
-    
-        # Free tier always allowed; flag premium quality
+        
+    if actor == 'client':
         tone = "plain English, brief"
     else:
         tone = "advocate-grade with full citations"
+        
     if not LOVABLE_API_KEY:
-        # Graceful fallback so the portal still works in dev
-        answer = (
-            f"[Offline AI] ISSUE: {question}\n"
-            "LAW: See Constitution of Kenya, 2010 Chapter Four (Bill of Rights). "
-            "APPLICATION: Configure LOVABLE_API_KEY for full grounded analysis. "
-            "CONCLUSION: Pending live model."
-        )
+        answer = "[Offline AI] ISSUE: Configure LOVABLE_API_KEY for full analysis."
     else:
         try:
             r = requests.post(
@@ -564,208 +737,185 @@ def ai_consult():
                 },
                 timeout=60,
             )
-            if r.status_code == 429:
-                return json_error("AI rate limit reached. Try again shortly.", 429)
-            if r.status_code == 402:
-                return json_error("AI credits exhausted. Top up workspace.", 402)
             r.raise_for_status()
             answer = r.json()['choices'][0]['message']['content']
         except Exception as e:
-            logging.exception("AI gateway failure")
             return json_error(f"AI failure: {e}", 502)
-    # Log
+
+    # Log the AI interaction
     try:
         conn = get_db(); cur = conn.cursor()
         cur.execute("""
             INSERT INTO ai_client_logs (case_number, client_name, actor, question, ai_response)
-            VALUES (%s,%s,%s,%s,%s)
-        """, (case_number or None, user_name or None, actor, question, answer))
+            VALUES (%s, %s, %s, %s, %s)
+        """, (case_number, user_name, actor, question, answer))
         conn.commit()
-    except Exception:
-        pass
-    return jsonify({"success": True, "engine": AI_MODEL, "answer": answer})
+    except Exception as e:
+        logging.error(f"Failed to log AI consult: {e}")
+  # =========================================================
+# 🆕 MISSING STAFF / ADMIN / SYSTEM ENDPOINTS
 # =========================================================
-# 💸 PAYMENTS
-# =========================================================
-@app.route('/api/payments/process', methods=['POST'])
-def process_payment():
-    p = request.get_json(silent=True) or {}
+from flask import request, jsonify
+
+# ---------- helper: alias add-matter -> cases ----------
+@app.route('/api/staff/add-matter', methods=['POST'])
+@require_staff(('admin', 'advocate', 'secretary'))
+def staff_add_matter_alias():
+    """Alias so frontend POST /api/staff/add-matter works."""
+    data = request.get_json(force=True) or {}
     try:
-        amount = float(p.get('amount') or 0)
-    except (TypeError, ValueError):
-        return json_error("Amount must be numeric.")
-    if amount <= 0:
-        return json_error("Valid amount required.")
-    account = (p.get('account_number') or '').strip()
-    method = (p.get('payment_method') or '').lower()
-    phone = (p.get('phone_number') or '').strip()
-    email = (p.get('email') or '').strip()
-    purpose = (p.get('purpose') or 'balance').lower()
-    if not account:
-        return json_error("Account/case number required.")
-    if method not in ('mpesa', 'card'):
-        return json_error("Select mpesa or card.")
-    if method == 'mpesa' and not phone:
-        return json_error("Phone number required for M-Pesa.")
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT case_number FROM cases WHERE LOWER(case_number)=LOWER(%s)", (account,))
-    if not cur.fetchone():
-        return json_error("Account does not match any case.", 404)
-    if method == 'mpesa':
-        try:
-            status_code, resp = initiate_stk_push(
-                phone, amount, account,
-                "AI Unlock" if purpose == 'ai_unlock' else "Legal Fees"
-            )
-        except Exception as e:
-            return json_error(f"M-Pesa gateway error: {e}", 502)
-        if status_code == 200 and str(resp.get('ResponseCode')) == '0':
-            cur.execute("""
-                INSERT INTO mpesa_transactions
-                (case_number, phone_number, amount, purpose,
-                 merchant_request_id, checkout_request_id, status)
-                VALUES (%s,%s,%s,%s,%s,%s,'PENDING')
-                ON CONFLICT (checkout_request_id) DO NOTHING
-            """, (account, _normalize_phone(phone), amount, purpose,
-                  resp.get('MerchantRequestID'), resp.get('CheckoutRequestID')))
-            conn.commit()
-            return jsonify({
-                "success": True,
-                "message": f"M-Pesa prompt sent to {phone}. Enter your PIN.",
-                "checkout_request_id": resp.get('CheckoutRequestID')
-            })
-        return json_error(
-            resp.get('errorMessage') or resp.get('CustomerMessage') or "STK push rejected.",
-            400, daraja=resp
-        )
-    # card
-    if not stripe.api_key:
-        return json_error("Stripe not configured.", 500)
-    try:
-        session = stripe.checkout.Session.create(
-            mode='payment',
-            payment_method_types=['card'],
-            line_items=[{
-                'price_data': {
-                    'currency': STRIPE_CURRENCY,
-                    'product_data': {'name': f"Legal Fees — Case {account}"},
-                    'unit_amount': int(round(amount * 100)),
-                },
-                'quantity': 1,
-            }],
-            customer_email=email or None,
-            metadata={'case_number': account, 'amount_kes': str(amount), 'purpose': purpose},
-            success_url=f"{STRIPE_SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=STRIPE_CANCEL_URL,
-        )
-        cur.execute("""
-            INSERT INTO stripe_transactions
-            (case_number, amount, currency, stripe_session_id, status, customer_email)
-            VALUES (%s,%s,%s,%s,'PENDING',%s)
-            ON CONFLICT (stripe_session_id) DO NOTHING
-        """, (account, amount, STRIPE_CURRENCY, session.id, email or None))
-        conn.commit()
-        return jsonify({"success": True, "checkout_url": session.url, "session_id": session.id})
-    except stripe.error.StripeError as e:
-        return json_error(f"Stripe error: {e}", 502)
-@app.route('/api/payments/status/<checkout_id>', methods=['GET'])
-def payment_status(checkout_id):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""
-        SELECT status, mpesa_receipt, result_desc, amount, case_number
-        FROM mpesa_transactions WHERE checkout_request_id=%s
-    """, (checkout_id,))
-    row = cur.fetchone()
-    if not row:
-        return json_error("Transaction not found.", 404)
-    return jsonify({"success": True, "transaction": row})
-# =========================================================
-# 🔔 WEBHOOKS
-# =========================================================
-@app.route('/api/public/mpesa/callback', methods=['POST'])
-def mpesa_callback():
-    try:
-        body = request.get_json(force=True, silent=True) or {}
-        logging.info(f"M-Pesa CB: {body}")
-        stk = body.get('Body', {}).get('stkCallback', {})
-        checkout_id = stk.get('CheckoutRequestID')
-        result_code = stk.get('ResultCode')
-        result_desc = stk.get('ResultDesc')
-        receipt, amount_paid = None, None
-        if result_code == 0:
-            for item in stk.get('CallbackMetadata', {}).get('Item', []) or []:
-                if item.get('Name') == 'MpesaReceiptNumber':
-                    receipt = item.get('Value')
-                elif item.get('Name') == 'Amount':
-                    amount_paid = float(item.get('Value') or 0)
         conn = get_db(); cur = conn.cursor()
         cur.execute("""
-            UPDATE mpesa_transactions
-            SET result_code=%s, result_desc=%s, mpesa_receipt=%s,
-                status=%s, completed_at=CURRENT_TIMESTAMP
-            WHERE checkout_request_id=%s
-            RETURNING case_number, amount, purpose
-        """, (result_code, result_desc, receipt,
-              'SUCCESS' if result_code == 0 else 'FAILED', checkout_id))
+            INSERT INTO cases
+              (case_number, client_name, client_phone, client_email,
+               matter_type, description, status, total_fee, balance,
+               next_court_date, assigned_to, created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+            RETURNING id, case_number
+        """, (
+            data.get('case_number'),
+            data.get('client_name'),
+            data.get('client_phone'),
+            data.get('client_email'),
+            data.get('matter_type'),
+            data.get('description'),
+            data.get('status', 'open'),
+            data.get('total_fee', 0),
+            data.get('balance', data.get('total_fee', 0)),
+            data.get('next_court_date'),
+            data.get('assigned_to'),
+        ))
         row = cur.fetchone()
-        if result_code == 0 and row:
-            credited = amount_paid if amount_paid else float(row['amount'])
-            unlock_ai = row['purpose'] == 'ai_unlock' and credited >= 5000
-            cur.execute("""
-                UPDATE cases
-                SET paid_balance = paid_balance + %s,
-                    ai_access_granted = (ai_access_granted OR %s),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE LOWER(case_number) = LOWER(%s)
-            """, (credited, unlock_ai, row['case_number']))
-        conn.commit()
-        return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"success": True, "id": row[0], "case_number": row[1]})
     except Exception as e:
-        logging.exception(f"M-Pesa callback failure: {e}")
-        return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
-@app.route('/api/public/stripe/webhook', methods=['POST'])
-def stripe_webhook():
-    payload = request.get_data(as_text=False)
-    sig = request.headers.get('Stripe-Signature', '')
-    if not STRIPE_WEBHOOK_SECRET:
-        return jsonify({"error": "Security misconfiguration"}), 500
+        app.logger.error(f"add-matter failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------- helper: alias update-matter -> PATCH cases ----------
+@app.route('/api/staff/update-matter', methods=['POST'])
+@require_staff(('admin', 'advocate', 'secretary'))
+def staff_update_matter_alias():
+    data = request.get_json(force=True) or {}
+    matter_id = data.get('id')
+    if not matter_id:
+        return jsonify({"success": False, "error": "id required"}), 400
+    fields, values = [], []
+    for k in ('status', 'description', 'next_court_date',
+              'total_fee', 'balance', 'notes', 'assigned_to'):
+        if k in data:
+            fields.append(f"{k} = %s")
+            values.append(data[k])
+    if not fields:
+        return jsonify({"success": False, "error": "no fields"}), 400
+    values.append(matter_id)
     try:
-        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+        conn = get_db(); cur = conn.cursor()
+        cur.execute(f"UPDATE cases SET {', '.join(fields)}, updated_at=NOW() WHERE id=%s", values)
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"error": f"Invalid signature: {e}"}), 400
+        app.logger.error(f"update-matter failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------- alias staff-upload -> upload-document ----------
+@app.route('/api/documents/staff-upload', methods=['POST'])
+@require_staff(('admin', 'advocate', 'secretary'))
+def staff_upload_alias():
+    # delegate to existing handler
+    return staff_upload_document()  # type: ignore[name-defined]
+
+
+# ---------- AI monitoring ----------
+@app.route('/api/staff/ai-monitoring', methods=['GET'])
+@require_staff(('admin', 'advocate', 'secretary'))
+def staff_ai_monitoring():
     try:
-        if event['type'] == 'checkout.session.completed':
-            obj = event['data']['object']
-            md = obj.get('metadata') or {}
-            case_number = md.get('case_number')
-            amount_kes = float(md.get('amount_kes') or 0)
-            purpose = md.get('purpose') or 'balance'
-            unlock_ai = purpose == 'ai_unlock' and amount_kes >= 5000
-            conn = get_db(); cur = conn.cursor()
-            cur.execute("""
-                UPDATE stripe_transactions
-                SET stripe_payment_intent=%s, status='SUCCESS',
-                    completed_at=CURRENT_TIMESTAMP,
-                    customer_email=%s
-                WHERE stripe_session_id=%s
-            """, (obj.get('payment_intent'),
-                  obj.get('customer_details', {}).get('email'),
-                  obj['id']))
-            cur.execute("""
-                UPDATE cases
-                SET paid_balance = paid_balance + %s,
-                    ai_access_granted = (ai_access_granted OR %s),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE LOWER(case_number) = LOWER(%s)
-            """, (amount_kes, unlock_ai, case_number))
-            conn.commit()
-        return jsonify({"status": "success"})
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("""
+            SELECT id, user_email, query, response, tokens_used, created_at
+            FROM ai_queries
+            ORDER BY created_at DESC
+            LIMIT 100
+        """)
+        rows = [
+            {"id": r[0], "user_email": r[1], "query": r[2],
+             "response": r[3], "tokens_used": r[4],
+             "created_at": r[5].isoformat() if r[5] else None}
+            for r in cur.fetchall()
+        ]
+        cur.close(); conn.close()
+        return jsonify({"success": True, "queries": rows, "total": len(rows)})
     except Exception as e:
-        logging.exception(f"Stripe webhook failure: {e}")
-        return jsonify({"error": "Webhook failed"}), 500
-# =========================================================
-# 🚀 BOOT
-# =========================================================
-init_db()  # ensure schema on import (gunicorn safe)
+        app.logger.error(f"ai-monitoring failed: {e}")
+        return jsonify({"success": False, "queries": [], "error": str(e)}), 200
+
+
+# ---------- system metrics ----------
+@app.route('/api/system/metrics', methods=['GET'])
+@require_staff(('admin', 'advocate', 'secretary'))
+def system_metrics():
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM cases"); cases = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM cases WHERE status='open'"); open_cases = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM mpesa_transactions WHERE status='Success'"); paid = cur.fetchone()[0]
+        cur.execute("SELECT COALESCE(SUM(amount),0) FROM mpesa_transactions WHERE status='Success'"); revenue = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM ai_queries"); ai_calls = cur.fetchone()[0]
+        cur.close(); conn.close()
+        return jsonify({
+            "success": True,
+            "lockdown": SYSTEM_STATE.get('LOCKDOWN_MODE', False),
+            "ai_unlocked": SYSTEM_STATE.get('AI_UNLOCKED', True),
+            "metrics": {
+                "total_cases": cases,
+                "open_cases": open_cases,
+                "paid_transactions": paid,
+                "revenue_kes": float(revenue or 0),
+                "ai_calls": ai_calls,
+            }
+        })
+    except Exception as e:
+        app.logger.error(f"system metrics failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------- admin: system override (lockdown switch) ----------
+@app.route('/api/admin/system-override', methods=['POST'])
+@require_staff(('admin',))
+def admin_system_override():
+    data = request.get_json(force=True) or {}
+    action = data.get('action')  # 'lockdown_on' | 'lockdown_off' | 'ai_lock' | 'ai_unlock'
+    if action == 'lockdown_on':
+        SYSTEM_STATE['LOCKDOWN_MODE'] = True
+    elif action == 'lockdown_off':
+        SYSTEM_STATE['LOCKDOWN_MODE'] = False
+    elif action == 'ai_lock':
+        SYSTEM_STATE['AI_UNLOCKED'] = False
+    elif action == 'ai_unlock':
+        SYSTEM_STATE['AI_UNLOCKED'] = True
+    else:
+        return jsonify({"success": False, "error": "unknown action"}), 400
+    return jsonify({"success": True, "state": SYSTEM_STATE})
+
+
+# ---------- billing: AI unlock (after payment) ----------
+@app.route('/api/billing/ai-unlock', methods=['POST'])
+@require_staff(('admin', 'advocate', 'secretary'))
+def billing_ai_unlock():
+    data = request.get_json(force=True) or {}
+    case_number = data.get('case_number')
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("UPDATE cases SET ai_unlocked=TRUE WHERE case_number=%s", (case_number,))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"success": True, "case_number": case_number, "ai_unlocked": True})
+    except Exception as e:
+        app.logger.error(f"ai-unlock failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+      
+    return jsonify({"success": True, "answer": answer})
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
