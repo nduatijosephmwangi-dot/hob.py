@@ -1,7 +1,7 @@
 """
 =====================================================================
- Wambui Shadrack Associates — Secure Legal Portal Backend
- Flask + PostgreSQL + M-Pesa Daraja + Resend Email
+ Wambui Shadrack Associates — Legal Portal Backend (v2, production)
+ Flask + PostgreSQL + M-Pesa Daraja STK Push + Stripe + Resend Email
 =====================================================================
 """
 import os
@@ -18,19 +18,20 @@ from requests.auth import HTTPBasicAuth
 from flask import Flask, request, jsonify, g, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+import stripe
 
 # =========================================================
-# ⚙️ APP CONFIGURATION & CORS
+# ⚙️ APP CONFIG
 # =========================================================
 app = Flask(__name__)
 
-# Permissive CORS for the Netlify Demo to eliminate "Blocked by CORS" errors
+# Permissive CORS to ensure frontend connects without errors
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 app.config['DATABASE_URL'] = os.environ.get('DATABASE_URL')
 app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', './client_docs/')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB max upload
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 SYSTEM_STATE = {"LOCKDOWN_MODE": False}
@@ -48,7 +49,7 @@ def init_pool():
             dsn=app.config['DATABASE_URL'],
             cursor_factory=RealDictCursor
         )
-        logging.info("✅ PostgreSQL Pool Initialized")
+        logging.info("✅ PostgreSQL pool initialized")
 
 def get_db():
     if 'db' not in g:
@@ -65,15 +66,13 @@ def close_db(_e=None):
         DB_POOL.putconn(db)
 
 # =========================================================
-# 🛠️ DATABASE SCHEMA & AUTO-SEED
+# 🛠️ DB SCHEMA + SEED
 # =========================================================
 def init_db():
     init_pool()
     conn = DB_POOL.getconn()
     try:
         cur = conn.cursor()
-        
-        # 1. Users & Auth
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id SERIAL PRIMARY KEY,
@@ -88,10 +87,6 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 expires_at TIMESTAMP NOT NULL
             );
-        """)
-        
-        # 2. Main Cases Ledger
-        cur.execute("""
             CREATE TABLE IF NOT EXISTS cases (
                 case_id SERIAL PRIMARY KEY,
                 case_number VARCHAR(255) UNIQUE NOT NULL,
@@ -104,10 +99,6 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        """)
-        
-        # 3. Documents Vault
-        cur.execute("""
             CREATE TABLE IF NOT EXISTS case_documents (
                 doc_id SERIAL PRIMARY KEY,
                 case_number VARCHAR(255) NOT NULL,
@@ -119,10 +110,6 @@ def init_db():
                 visible_to_client BOOLEAN DEFAULT TRUE,
                 upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        """)
-        
-        # 4. Telemetry & Logs
-        cur.execute("""
             CREATE TABLE IF NOT EXISTS ai_client_logs (
                 log_id SERIAL PRIMARY KEY,
                 case_number VARCHAR(255),
@@ -134,7 +121,6 @@ def init_db():
             );
         """)
         
-        # 5. Seed Staff Accounts
         seed_users = [
             ('Shadrack Wambui', '0700260086', 'shadrack@wambuishadrack.co.ke', 'admin'),
             ('Jeff Kangethe',   '0704704758', 'jeff@wambuishadrack.co.ke',     'advocate'),
@@ -146,9 +132,8 @@ def init_db():
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (email) DO UPDATE SET role = EXCLUDED.role, full_name = EXCLUDED.full_name;
             """, (name, phone, email, role))
-            
         conn.commit()
-        logging.info("💾 Database schema verified and synchronized.")
+        logging.info("💾 Database schema synchronized.")
     except Exception as e:
         conn.rollback()
         logging.exception(f"DB init failure: {e}")
@@ -157,8 +142,14 @@ def init_db():
         DB_POOL.putconn(conn)
 
 # =========================================================
-# 🔑 SECURITY HELPERS & MIDDLEWARE
+# 🔑 HELPERS
 # =========================================================
+def _normalize_phone(phone: str) -> str:
+    p = str(phone or '').strip().replace(' ', '').replace('-', '').replace('+', '')
+    if p.startswith('0') and len(p) == 10: p = '254' + p[1:]
+    elif p.startswith('7') and len(p) == 9: p = '254' + p
+    return p
+
 def _normalize_email(value: str) -> str:
     return (value or '').strip().lower()
 
@@ -173,46 +164,130 @@ def require_staff(roles=('admin', 'advocate', 'secretary')):
         def wrapper(*args, **kwargs):
             if SYSTEM_STATE['LOCKDOWN_MODE']:
                 return json_error("SYSTEM IN LOCKDOWN.", 403)
-                
             email = _normalize_email(request.headers.get('X-User-Email', ''))
             if not email:
                 return json_error("Authentication required.", 401)
-                
             conn = get_db(); cur = conn.cursor()
             cur.execute("SELECT role, full_name FROM users WHERE LOWER(email)=%s", (email,))
             row = cur.fetchone()
             if not row or row['role'] not in roles:
-                return json_error("Forbidden Access.", 403)
-                
+                return json_error("Forbidden.", 403)
             g.current_user = {"email": email, "role": row['role'], "name": row['full_name']}
             return fn(*args, **kwargs)
         return wrapper
     return deco
 
 # =========================================================
-# 🔐 AUTHENTICATION ROUTER
+# 📧 RESEND EMAIL (RESTORED)
+# =========================================================
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM = os.environ.get("RESEND_FROM", "onboarding@resend.dev")
+
+def send_otp_email(email: str, otp: str, name: str = ""):
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY missing"
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from": RESEND_FROM,
+                "to": [email],
+                "subject": "Wambui Shadrack Advocates — Verification Code",
+                "html": f"""
+                    <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;">
+                      <h2 style="color:#0a2540;">Wambui Shadrack &amp; Associates</h2>
+                      <p>Hello {name or 'Counsel'},</p>
+                      <p>Your secure verification code is:</p>
+                      <div style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#c9a961;
+                                  background:#f7f5ef;padding:16px;text-align:center;border-radius:8px;">
+                        {otp}
+                      </div>
+                      <p style="color:#666;font-size:13px;">This code expires in 10 minutes.</p>
+                    </div>
+                """,
+            },
+            timeout=15,
+        )
+        if r.status_code in (200, 201): return True, "delivered"
+        return False, f"Resend API Error {r.status_code}"
+    except Exception as e:
+        return False, f"Email exception: {e}"
+
+# =========================================================
+# 💰 M-PESA DARAJA (RESTORED)
+# =========================================================
+MPESA_ENV = os.environ.get('MPESA_ENV', 'sandbox').lower()
+MPESA_CONSUMER_KEY = os.environ.get('MPESA_CONSUMER_KEY', '')
+MPESA_CONSUMER_SECRET = os.environ.get('MPESA_CONSUMER_SECRET', '')
+MPESA_SHORTCODE = os.environ.get('MPESA_SHORTCODE', '4747331')
+MPESA_PASSKEY = os.environ.get('MPESA_PASSKEY', '')
+MPESA_CALLBACK_URL = os.environ.get('MPESA_CALLBACK_URL', '')
+MPESA_TRANSACTION_TYPE = os.environ.get('MPESA_TRANSACTION_TYPE', 'CustomerPayBillOnline')
+MPESA_BASE = 'https://api.safaricom.co.ke' if MPESA_ENV == 'production' else 'https://sandbox.safaricom.co.ke'
+
+def get_mpesa_token():
+    if not MPESA_CONSUMER_KEY or not MPESA_CONSUMER_SECRET:
+        raise RuntimeError("M-Pesa credentials not configured.")
+    r = requests.get(
+        f"{MPESA_BASE}/oauth/v1/generate?grant_type=client_credentials",
+        auth=HTTPBasicAuth(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET),
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json().get('access_token')
+
+def initiate_stk_push(phone, amount, account_ref, description="Legal Fees"):
+    try:
+        token = get_mpesa_token()
+        ts = datetime.now().strftime('%Y%m%d%H%M%S')
+        password = base64.b64encode(f"{MPESA_SHORTCODE}{MPESA_PASSKEY}{ts}".encode()).decode('utf-8')
+        payload = {
+            "BusinessShortCode": MPESA_SHORTCODE,
+            "Password": password,
+            "Timestamp": ts,
+            "TransactionType": MPESA_TRANSACTION_TYPE,
+            "Amount": int(round(float(amount))),
+            "PartyA": _normalize_phone(phone),
+            "PartyB": MPESA_SHORTCODE,
+            "PhoneNumber": _normalize_phone(phone),
+            "CallBackURL": MPESA_CALLBACK_URL,
+            "AccountReference": (account_ref or "LegalFees")[:12],
+            "TransactionDesc": (description or "Legal Fees")[:13],
+        }
+        r = requests.post(
+            f"{MPESA_BASE}/mpesa/stkpush/v1/processrequest",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        return r.status_code, r.json() if r.status_code in (200, 201) else {"error": r.text}
+    except Exception as e:
+        return 500, {"error": str(e)}
+
+# =========================================================
+# 💳 STRIPE CONFIGURATION
+# =========================================================
+stripe.api_key = os.environ.get('STRIPE_SECRET_KEY', '')
+
+# =========================================================
+# 🔐 AUTH & OTP
 # =========================================================
 @app.route('/api/auth/login-router', methods=['POST'])
 def login_router():
     if SYSTEM_STATE['LOCKDOWN_MODE']:
         return jsonify({"success": False, "message": "PORTAL UNDER SECURITY LOCKDOWN. ACCESS DENIED."}), 503
-        
     payload = request.get_json(silent=True) or {}
     credential = (payload.get('credential') or '').strip()
+    if not credential: return json_error("Login field cannot be blank.")
     
-    if not credential:
-        return json_error("Login field cannot be blank.")
-        
-    # If it contains @, route to Staff OTP Protocol
     if '@' in credential:
         email = _normalize_email(credential)
         conn = get_db(); cur = conn.cursor()
         cur.execute("SELECT full_name, role FROM users WHERE LOWER(email)=%s", (email,))
         account = cur.fetchone()
+        if not account: return json_error("Access denied: Not a registered staff member.", 403)
         
-        if not account:
-            return json_error("Access denied: Not a registered staff member.", 403)
-            
         otp = str(random.randint(100000, 999999))
         cur.execute("""
             INSERT INTO otp_vault_email (email, code, expires_at)
@@ -221,35 +296,27 @@ def login_router():
         """, (email, otp))
         conn.commit()
         
-        logging.info(f"SECURITY OTP FOR {email}: {otp}")
+        ok, info = send_otp_email(email, otp, account['full_name'])
+        logging.info(f"🔑 [SECURITY TESTING] GENERATED OTP FOR {email} IS: {otp} | Delivered: {ok} ({info})")
         
         return jsonify({
             "success": True, "mode": "otp_required", "role_preview": account['role'], 
             "message": f"Check your email for the verification code."
         })
-        
-    # Otherwise, route to OTP-Free Client Protocol
     else:
         conn = get_db(); cur = conn.cursor()
         cur.execute("""
-            SELECT case_id, case_number, client_name, ai_access_granted, 
-                   next_court_date, coming_up_for, total_balance, paid_balance
+            SELECT case_number, client_name, ai_access_granted, next_court_date, coming_up_for, total_balance, paid_balance
             FROM cases WHERE LOWER(case_number) = LOWER(%s) LIMIT 1
         """, (credential,))
         case = cur.fetchone()
-        
-        if not case:
-            return json_error("No case found matching that reference.", 404)
-            
-        total = float(case['total_balance'] or 0)
-        paid = float(case['paid_balance'] or 0)
+        if not case: return json_error("No case found matching that reference.", 404)
+        total, paid = float(case['total_balance'] or 0), float(case['paid_balance'] or 0)
         return jsonify({
             "success": True, "mode": "client_dashboard",
             "data": {
-                "case_number": case['case_number'],
-                "client_name": case['client_name'],
-                "next_court_date": case['next_court_date'],
-                "coming_up_for": case['coming_up_for'],
+                "case_number": case['case_number'], "client_name": case['client_name'],
+                "next_court_date": case['next_court_date'], "coming_up_for": case['coming_up_for'],
                 "financials": {"total": total, "paid": paid, "balance": total - paid},
                 "ai_unlocked": case['ai_access_granted']
             }
@@ -260,58 +327,45 @@ def verify_otp():
     data = request.get_json(silent=True) or {}
     email = _normalize_email(data.get('email') or data.get('phone') or '')
     code = (data.get('code') or '').strip()
-    
-    if not email or not code:
-        return json_error("Identity parameters missing.")
+    if not email or not code: return json_error("Identity parameters missing.")
         
     conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT code FROM otp_vault_email WHERE email=%s AND expires_at > NOW();", (email,))
     rec = cur.fetchone()
-    
-    if not rec or rec['code'] != code:
-        return json_error("Invalid or Expired Security Token.", 401)
+    if not rec or rec['code'] != code: return json_error("Invalid or Expired Security Token.", 401)
         
     cur.execute("DELETE FROM otp_vault_email WHERE email=%s;", (email,))
     cur.execute("SELECT full_name, role FROM users WHERE LOWER(email)=%s;", (email,))
     prof = cur.fetchone()
     conn.commit()
     
-    return jsonify({
-        "success": True, "email": email, "role": prof['role'], "user_name": prof['full_name']
-    })
+    return jsonify({"success": True, "email": email, "role": prof['role'], "user_name": prof['full_name']})
 
 @app.route('/api/auth/resend-otp', methods=['POST'])
 def resend_otp():
     data = request.get_json(silent=True) or {}
     email = _normalize_email(data.get('email') or data.get('phone') or '')
+    if not email: return json_error("Email missing.")
     
-    if not email:
-        return json_error("Email identity parameter missing.")
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT full_name FROM users WHERE LOWER(email)=%s;", (email,))
+    account = cur.fetchone()
+    if not account: return json_error("Not a registered staff member.", 403)
         
     new_otp = str(random.randint(100000, 999999))
-    conn = get_db(); cur = conn.cursor()
-    
     cur.execute("""
-        UPDATE otp_vault_email 
-        SET code = %s, expires_at = NOW() + INTERVAL '10 minutes'
-        WHERE email = %s;
-    """, (new_otp, email))
-    
-    if cur.rowcount == 0:
-        # If record context was cleaned up or timed out entirely, insert a fresh baseline record
-        cur.execute("""
-            INSERT INTO otp_vault_email (email, code, expires_at)
-            VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
-            ON CONFLICT (email) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at;
-        """, (email, new_otp))
-        
+        INSERT INTO otp_vault_email (email, code, expires_at)
+        VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
+        ON CONFLICT (email) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at;
+    """, (email, new_otp))
     conn.commit()
-    logging.info(f"🔄 RESENT SECURITY OTP FOR {email}: {new_otp}")
     
+    ok, info = send_otp_email(email, new_otp, account['full_name'])
+    logging.info(f"🔄 [SECURITY TESTING] RESENT OTP FOR {email} IS: {new_otp} | Delivered: {ok} ({info})")
     return jsonify({"success": True, "message": "A fresh 6-digit access code has been issued."})
 
 # =========================================================
-# 📂 STAFF OPERATIONS (SEARCH, ADD, UPDATE)
+# 📂 STAFF OPERATIONS (RESTORED ALIASES)
 # =========================================================
 @app.route('/api/staff/cases', methods=['GET'])
 @app.route('/api/staff/search', methods=['GET', 'POST'])
@@ -319,32 +373,23 @@ def resend_otp():
 def list_or_search_cases():
     q = request.args.get('q') or (request.get_json(silent=True) or {}).get('query') or ''
     q = q.strip()
-    
     conn = get_db(); cur = conn.cursor()
     if q:
         like = f"%{q}%"
-        cur.execute("""
-            SELECT * FROM cases 
-            WHERE case_number ILIKE %s OR client_name ILIKE %s 
-            ORDER BY updated_at DESC LIMIT 100
-        """, (like, like))
+        cur.execute("SELECT * FROM cases WHERE case_number ILIKE %s OR client_name ILIKE %s ORDER BY updated_at DESC LIMIT 100", (like, like))
     else:
         cur.execute("SELECT * FROM cases ORDER BY updated_at DESC LIMIT 100")
-        
+    
     raw_rows = cur.fetchall()
     clean_rows = []
-    
     for r in raw_rows:
         c = dict(r)
         c['total_balance'] = float(c.get('total_balance') or 0.0)
         c['paid_balance'] = float(c.get('paid_balance') or 0.0)
-        
         if g.current_user['role'] != 'admin':
             c['total_balance'] = "RESTRICTED"
             c['paid_balance'] = "RESTRICTED"
-            
         clean_rows.append(c)
-        
     return jsonify({"success": True, "cases": clean_rows, "results": clean_rows})
 
 @app.route('/api/staff/add-matter', methods=['POST'])
@@ -352,22 +397,15 @@ def list_or_search_cases():
 def add_matter():
     data = request.get_json(silent=True) or {}
     case_number = (data.get('case_number') or '').strip()
-    
-    if not case_number:
-        return json_error("Case Reference Number is required.")
+    if not case_number: return json_error("Case Reference Number is required.")
         
     is_admin = g.current_user['role'] == 'admin'
     conn = get_db(); cur = conn.cursor()
-    
     try:
         cur.execute("""
             INSERT INTO cases (case_number, client_name, total_balance, paid_balance)
             VALUES (%s, %s, %s, %s)
-        """, (
-            case_number, data.get('client_name'),
-            float(data.get('total_balance') or 0) if is_admin else 0,
-            float(data.get('paid_balance') or 0) if is_admin else 0
-        ))
+        """, (case_number, data.get('client_name'), float(data.get('total_balance') or 0) if is_admin else 0, float(data.get('paid_balance') or 0) if is_admin else 0))
         conn.commit()
         return jsonify({"success": True, "message": "Registry Ledger Updated Successfully."})
     except psycopg2.IntegrityError:
@@ -379,30 +417,22 @@ def add_matter():
 def update_matter():
     data = request.get_json(silent=True) or {}
     case_id = data.get('case_id')
-    
-    if not case_id:
-        return json_error("Matter Identification Ref Required.")
+    if not case_id: return json_error("Matter Identification Ref Required.")
         
     sets, vals = [], []
     fields = ['next_court_date', 'coming_up_for']
-    if g.current_user['role'] == 'admin':
-        fields += ['total_balance', 'paid_balance']
-        
+    if g.current_user['role'] == 'admin': fields += ['total_balance', 'paid_balance']
     for f in fields:
         if f in data and data[f] is not None:
             sets.append(f"{f} = %s")
             vals.append(data[f])
-            
-    if not sets:
-        return json_error("No modifications detected.")
+    if not sets: return json_error("No modifications detected.")
         
     sets.append("updated_at = CURRENT_TIMESTAMP")
     vals.append(case_id)
-    
     conn = get_db(); cur = conn.cursor()
     cur.execute(f"UPDATE cases SET {', '.join(sets)} WHERE case_id = %s", vals)
     conn.commit()
-    
     return jsonify({"success": True, "message": "Case File Modified Successfully."})
 
 # =========================================================
@@ -412,58 +442,39 @@ def update_matter():
 def list_docs():
     case_number = (request.args.get('case_number') or '').strip()
     if not case_number: return jsonify({"success": True, "files": []})
-    
     conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT filename FROM case_documents WHERE case_number=%s ORDER BY upload_date DESC", (case_number,))
-    files = cur.fetchall()
-    return jsonify({"success": True, "files": files})
+    return jsonify({"success": True, "files": cur.fetchall()})
 
 @app.route('/api/documents/client-upload', methods=['POST'])
 @app.route('/api/documents/staff-upload', methods=['POST'])
 def unified_upload():
     file = request.files.get('document')
     case_number = (request.form.get('case_number') or '').strip()
-    
-    if not file or not case_number:
-        return json_error("Missing file or case routing number.")
+    if not file or not case_number: return json_error("Missing file or case routing number.")
         
     safe_name = secure_filename(file.filename or 'upload.pdf')
     stamp = datetime.now().strftime('%Y%m%d%H%M%S')
     stored_name = f"{case_number.replace('/', '_')}__{stamp}__{safe_name}"
-    
-    path = os.path.join(app.config['UPLOAD_FOLDER'], stored_name)
-    file.save(path)
+    file.save(os.path.join(app.config['UPLOAD_FOLDER'], stored_name))
     
     conn = get_db(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO case_documents (case_number, filename, original_name, uploaded_by_role)
-        VALUES (%s, %s, %s, 'system')
-    """, (case_number, stored_name, safe_name))
+    cur.execute("INSERT INTO case_documents (case_number, filename, original_name, uploaded_by_role) VALUES (%s, %s, %s, 'system')", (case_number, stored_name, safe_name))
     conn.commit()
-    
     return jsonify({"success": True, "message": "Document successfully ingested to secure storage."})
 
 # =========================================================
-# 🛡️ SYSTEM METRICS, AI LOGS, & CYBER KILL SWITCH
+# 🛡️ SYSTEM METRICS & AI LOGS
 # =========================================================
 @app.route('/api/system/metrics', methods=['GET'])
 @require_staff()
 def system_metrics():
     conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) as count FROM cases;")
-    cases_count = cur.fetchone()['count']
-    
-    cur.execute("SELECT COUNT(*) as count FROM ai_client_logs;")
-    ai_count = cur.fetchone()['count']
-    
+    cur.execute("SELECT COUNT(*) as count FROM cases;"); cases_count = cur.fetchone()['count']
+    cur.execute("SELECT COUNT(*) as count FROM ai_client_logs;"); ai_count = cur.fetchone()['count']
     return jsonify({
-        "success": True,
-        "cloud_status": "SECURE" if not SYSTEM_STATE['LOCKDOWN_MODE'] else "ISOLATED",
-        "live_metrics": {
-            "total_requests": cases_count + ai_count,
-            "failed_logins": 0,
-            "ai_queries_processed": ai_count
-        }
+        "success": True, "cloud_status": "SECURE" if not SYSTEM_STATE['LOCKDOWN_MODE'] else "ISOLATED",
+        "live_metrics": {"total_requests": cases_count + ai_count, "failed_logins": 0, "ai_queries_processed": ai_count}
     })
 
 @app.route('/api/staff/ai-monitoring', methods=['GET'])
@@ -471,58 +482,82 @@ def system_metrics():
 def ai_monitoring():
     conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT case_number, question FROM ai_client_logs ORDER BY logged_at DESC LIMIT 50")
-    rows = cur.fetchall()
-    
-    logs = [{"case_number": r['case_number'], "client_question": r['question']} for r in rows]
-    return jsonify({"success": True, "logs": logs})
+    return jsonify({"success": True, "logs": [{"case_number": r['case_number'], "client_question": r['question']} for r in cur.fetchall()]})
 
 @app.route('/api/admin/system-override', methods=['POST'])
 @require_staff(('admin',))
 def admin_system_override():
-    data = request.get_json(silent=True) or {}
-    action = data.get('action')
-    
-    if action == 'LOCK':
-        SYSTEM_STATE['LOCKDOWN_MODE'] = True
-    elif action == 'UNLOCK':
-        SYSTEM_STATE['LOCKDOWN_MODE'] = False
-        
+    action = (request.get_json(silent=True) or {}).get('action')
+    if action == 'LOCK': SYSTEM_STATE['LOCKDOWN_MODE'] = True
+    elif action == 'UNLOCK': SYSTEM_STATE['LOCKDOWN_MODE'] = False
     return jsonify({"success": True, "message": f"System state shifted to {action}."})
 
 # =========================================================
-# 💸 BILLING MOCK ENDPOINT (M-PESA / AI UNLOCK)
+# 💸 BILLING (RESTORED M-PESA & AI UNLOCK)
 # =========================================================
 @app.route('/api/billing/ai-unlock', methods=['POST'])
 def billing_ai_unlock():
     data = request.get_json(silent=True) or {}
     case_number = data.get('case_number')
-    
+    method = data.get('method')
+    amount = data.get('amount', 500)
+    phone = data.get('phone')
+
+    # If user selected M-Pesa, trigger real Daraja Push
+    if method == 'mpesa' and phone:
+        status, resp = initiate_stk_push(phone, amount, case_number, "AI Access Unlock")
+        if status not in (200, 201):
+            return json_error("M-Pesa transaction failed to initiate.", 400, details=resp)
+
+    # Regardless of method, unlock the file in the database
     conn = get_db(); cur = conn.cursor()
     cur.execute("UPDATE cases SET ai_access_granted=TRUE WHERE case_number=%s", (case_number,))
     conn.commit()
-    
     return jsonify({"success": True, "message": "Transaction verified. AI framework unlocked."})
 
 # =========================================================
-# 🧠 AI ENGINE MOCK ENDPOINT
+# 🧠 AI ENGINE (RESTORED LOVABLE API)
 # =========================================================
+LOVABLE_API_KEY = os.environ.get('LOVABLE_API_KEY', '')
+AI_MODEL = os.environ.get('AI_MODEL', 'google/gemini-2.5-flash')
+
 @app.route('/api/ai/consult', methods=['POST'])
 def ai_consult():
     data = request.get_json(silent=True) or {}
     q = data.get('question', '')
     case_no = data.get('case_number', 'Staff Query')
+    actor = data.get('actor', 'client')
+    tone = "plain English" if actor == 'client' else "advocate-grade with full citations"
     
-    answer = f"According to the Constitution of Kenya 2010, regarding '{q}': The legal precedent is currently being evaluated. Please consult principal advocate Shadrack Wambui for immediate strategy."
-    
+    if not LOVABLE_API_KEY:
+        answer = "[Offline AI] ISSUE: Configure LOVABLE_API_KEY for full analysis."
+    else:
+        try:
+            r = requests.post(
+                "https://ai.gateway.lovable.dev/v1/chat/completions",
+                headers={"Authorization": f"Bearer {LOVABLE_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": AI_MODEL,
+                    "messages": [
+                        {"role": "system", "content": f"You are a Kenyan legal assistant. Answer in {tone}."},
+                        {"role": "user", "content": q},
+                    ],
+                    "temperature": 0.3,
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            answer = r.json()['choices'][0]['message']['content']
+        except Exception as e:
+            return json_error(f"AI Gateway failure: {e}", 502)
+
     conn = get_db(); cur = conn.cursor()
-    cur.execute("INSERT INTO ai_client_logs (case_number, question, ai_response) VALUES (%s, %s, %s)", 
-               (case_no, q, answer))
+    cur.execute("INSERT INTO ai_client_logs (case_number, question, ai_response) VALUES (%s, %s, %s)", (case_no, q, answer))
     conn.commit()
-    
-    return jsonify({"success": True, "engine": "Gemini-Legal-Core", "answer": answer})
+    return jsonify({"success": True, "engine": AI_MODEL, "answer": answer})
 
 # =========================================================
-# 🚀 INITIALIZATION & SERVER START
+# 🚀 SERVER START
 # =========================================================
 with app.app_context():
     init_db()
