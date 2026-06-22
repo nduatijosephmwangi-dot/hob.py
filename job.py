@@ -91,6 +91,7 @@ def init_db():
                 case_id SERIAL PRIMARY KEY,
                 case_number VARCHAR(255) UNIQUE NOT NULL,
                 client_name VARCHAR(255),
+                 case_parties VARCHAR(255),   
                 next_court_date VARCHAR(255),
                 coming_up_for TEXT,
                 total_balance NUMERIC(15,2) DEFAULT 0.00,
@@ -315,7 +316,7 @@ def login_router():
         return jsonify({
             "success": True, "mode": "client_dashboard",
             "data": {
-                "case_number": case['case_number'], "client_name": case['client_name'],
+                "case_number": case['case_number'], "client_name" : case['client_name'],
                 "next_court_date": case['next_court_date'], "coming_up_for": case['coming_up_for'],
                 "financials": {"total": total, "paid": paid, "balance": total - paid},
                 "ai_unlocked": case['ai_access_granted']
@@ -416,8 +417,8 @@ def add_matter():
 @require_staff()
 def update_matter():
     data = request.get_json(silent=True) or {}
-    case_id = data.get('case_id')
-    if not case_id: return json_error("Matter Identification Ref Required.")
+    case_number = data.get('case_number')
+    if not case_number: return json_error("Matter Identification Ref Required.")
         
     sets, vals = [], []
     fields = ['next_court_date', 'coming_up_for']
@@ -429,9 +430,9 @@ def update_matter():
     if not sets: return json_error("No modifications detected.")
         
     sets.append("updated_at = CURRENT_TIMESTAMP")
-    vals.append(case_id)
+    vals.append(case_number)
     conn = get_db(); cur = conn.cursor()
-    cur.execute(f"UPDATE cases SET {', '.join(sets)} WHERE case_id = %s", vals)
+    cur.execute(f"UPDATE cases SET {', '.join(sets)} WHERE case_number = %s", vals)
     conn.commit()
     return jsonify({"success": True, "message": "Case File Modified Successfully."})
 
@@ -555,7 +556,11 @@ def ai_consult():
     cur.execute("INSERT INTO ai_client_logs (case_number, question, ai_response) VALUES (%s, %s, %s)", (case_no, q, answer))
     conn.commit()
     return jsonify({"success": True, "engine": AI_MODEL, "answer": answer})
-
+@app.route('/api/documents/download/<filename>', methods=['GET'])
+@require_staff()
+def download_doc(filename):
+    # This serves the file from your local folder
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 # =========================================================
 # 🚀 SERVER START
 # =========================================================
