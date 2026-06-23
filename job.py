@@ -91,7 +91,7 @@ def init_db():
                 case_id SERIAL PRIMARY KEY,
                 case_number VARCHAR(255) UNIQUE NOT NULL,
                 client_name VARCHAR(255),
-                 case_parties VARCHAR(255),   
+                case_parties VARCHAR(255),   
                 next_court_date VARCHAR(255),
                 coming_up_for TEXT,
                 total_balance NUMERIC(15,2) DEFAULT 0.00,
@@ -179,7 +179,7 @@ def require_staff(roles=('admin', 'advocate', 'secretary')):
     return deco
 
 # =========================================================
-# 📧 RESEND EMAIL (RESTORED)
+# 📧 RESEND EMAIL
 # =========================================================
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM = os.environ.get("RESEND_FROM", "onboarding@resend.dev")
@@ -216,7 +216,7 @@ def send_otp_email(email: str, otp: str, name: str = ""):
         return False, f"Email exception: {e}"
 
 # =========================================================
-# 💰 M-PESA DARAJA (RESTORED)
+# 💰 M-PESA DARAJA
 # =========================================================
 MPESA_ENV = os.environ.get('MPESA_ENV', 'sandbox').lower()
 MPESA_CONSUMER_KEY = os.environ.get('MPESA_CONSUMER_KEY', '')
@@ -307,17 +307,21 @@ def login_router():
     else:
         conn = get_db(); cur = conn.cursor()
         cur.execute("""
-            SELECT case_number, client_name, ai_access_granted, next_court_date, coming_up_for, total_balance, paid_balance
+            SELECT case_number, client_name, case_parties, ai_access_granted, next_court_date, coming_up_for, total_balance, paid_balance
             FROM cases WHERE LOWER(case_number) = LOWER(%s) LIMIT 1
         """, (credential,))
         case = cur.fetchone()
         if not case: return json_error("No case found matching that reference.", 404)
         total, paid = float(case['total_balance'] or 0), float(case['paid_balance'] or 0)
+        
         return jsonify({
             "success": True, "mode": "client_dashboard",
             "data": {
-                "case_number": case['case_number'], "client_name" : case['client_name'],
-                "next_court_date": case['next_court_date'], "coming_up_for": case['coming_up_for'],
+                "case_number": case['case_number'], 
+                "client_name" : case['client_name'],
+                "case_parties": case['case_parties'],
+                "next_court_date": case['next_court_date'], 
+                "coming_up_for": case['coming_up_for'],
                 "financials": {"total": total, "paid": paid, "balance": total - paid},
                 "ai_unlocked": case['ai_access_granted']
             }
@@ -366,7 +370,7 @@ def resend_otp():
     return jsonify({"success": True, "message": "A fresh 6-digit access code has been issued."})
 
 # =========================================================
-# 📂 STAFF OPERATIONS (RESTORED ALIASES)
+# 📂 STAFF OPERATIONS 
 # =========================================================
 @app.route('/api/staff/cases', methods=['GET'])
 @app.route('/api/staff/search', methods=['GET', 'POST'])
@@ -375,11 +379,12 @@ def list_or_search_cases():
     q = request.args.get('q') or (request.get_json(silent=True) or {}).get('query') or ''
     q = q.strip()
     conn = get_db(); cur = conn.cursor()
+    
     if q:
         like = f"%{q}%"
-        cur.execute("SELECT * FROM cases WHERE case_number ILIKE %s OR client_name ILIKE %s ORDER BY updated_at DESC LIMIT 100", (like, like))
+        cur.execute("SELECT * FROM cases WHERE case_number ILIKE %s OR client_name ILIKE %s ORDER BY updated_at DESC", (like, like))
     else:
-        cur.execute("SELECT * FROM cases ORDER BY updated_at DESC LIMIT 100")
+        cur.execute("SELECT * FROM cases ORDER BY updated_at DESC")
     
     raw_rows = cur.fetchall()
     clean_rows = []
@@ -421,7 +426,7 @@ def update_matter():
     if not case_number: return json_error("Matter Identification Ref Required.")
         
     sets, vals = [], []
-    fields = ['next_court_date', 'coming_up_for']
+    fields = ['next_court_date', 'coming_up_for', 'case_parties']
     if g.current_user['role'] == 'admin': fields += ['total_balance', 'paid_balance']
     for f in fields:
         if f in data and data[f] is not None:
@@ -464,6 +469,11 @@ def unified_upload():
     conn.commit()
     return jsonify({"success": True, "message": "Document successfully ingested to secure storage."})
 
+@app.route('/api/documents/download/<filename>', methods=['GET'])
+@require_staff()
+def download_doc(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
 # =========================================================
 # 🛡️ SYSTEM METRICS & AI LOGS
 # =========================================================
@@ -494,7 +504,7 @@ def admin_system_override():
     return jsonify({"success": True, "message": f"System state shifted to {action}."})
 
 # =========================================================
-# 💸 BILLING (RESTORED M-PESA & AI UNLOCK)
+# 💸 BILLING 
 # =========================================================
 @app.route('/api/billing/ai-unlock', methods=['POST'])
 def billing_ai_unlock():
@@ -504,20 +514,18 @@ def billing_ai_unlock():
     amount = data.get('amount', 500)
     phone = data.get('phone')
 
-    # If user selected M-Pesa, trigger real Daraja Push
     if method == 'mpesa' and phone:
         status, resp = initiate_stk_push(phone, amount, case_number, "AI Access Unlock")
         if status not in (200, 201):
             return json_error("M-Pesa transaction failed to initiate.", 400, details=resp)
 
-    # Regardless of method, unlock the file in the database
     conn = get_db(); cur = conn.cursor()
     cur.execute("UPDATE cases SET ai_access_granted=TRUE WHERE case_number=%s", (case_number,))
     conn.commit()
     return jsonify({"success": True, "message": "Transaction verified. AI framework unlocked."})
 
 # =========================================================
-# 🧠 AI ENGINE (RESTORED LOVABLE API)
+# 🧠 AI ENGINE
 # =========================================================
 LOVABLE_API_KEY = os.environ.get('LOVABLE_API_KEY', '')
 AI_MODEL = os.environ.get('AI_MODEL', 'google/gemini-2.5-flash')
@@ -556,11 +564,7 @@ def ai_consult():
     cur.execute("INSERT INTO ai_client_logs (case_number, question, ai_response) VALUES (%s, %s, %s)", (case_no, q, answer))
     conn.commit()
     return jsonify({"success": True, "engine": AI_MODEL, "answer": answer})
-@app.route('/api/documents/download/<filename>', methods=['GET'])
-@require_staff()
-def download_doc(filename):
-    # This serves the file from your local folder
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
 # =========================================================
 # 🚀 SERVER START
 # =========================================================
