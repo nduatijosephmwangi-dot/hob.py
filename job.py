@@ -382,7 +382,15 @@ def list_or_search_cases():
     
     if q:
         like = f"%{q}%"
-        cur.execute("SELECT * FROM cases WHERE case_number ILIKE %s OR client_name ILIKE %s ORDER BY updated_at DESC", (like, like))
+        cur.execute("""
+            SELECT * FROM cases
+            WHERE case_number     ILIKE %s
+               OR client_name     ILIKE %s
+               OR case_parties    ILIKE %s
+               OR coming_up_for   ILIKE %s
+               OR next_court_date ILIKE %s
+            ORDER BY updated_at DESC
+        """, (like, like, like, like, like))
     else:
         cur.execute("SELECT * FROM cases ORDER BY updated_at DESC")
     
@@ -409,9 +417,15 @@ def add_matter():
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute("""
-            INSERT INTO cases (case_number, client_name, total_balance, paid_balance)
-            VALUES (%s, %s, %s, %s)
-        """, (case_number, data.get('client_name'), float(data.get('total_balance') or 0) if is_admin else 0, float(data.get('paid_balance') or 0) if is_admin else 0))
+            INSERT INTO cases (case_number, client_name, case_parties, total_balance, paid_balance)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            case_number,
+            data.get('client_name') or data.get('case_parties'),
+            data.get('case_parties') or data.get('client_name'),
+            float(data.get('total_balance') or 0) if is_admin else 0,
+            float(data.get('paid_balance') or 0) if is_admin else 0,
+        ))
         conn.commit()
         return jsonify({"success": True, "message": "Registry Ledger Updated Successfully."})
     except psycopg2.IntegrityError:
@@ -496,12 +510,30 @@ def ai_monitoring():
     return jsonify({"success": True, "logs": [{"case_number": r['case_number'], "client_question": r['question']} for r in cur.fetchall()]})
 
 @app.route('/api/admin/system-override', methods=['POST'])
-@require_staff(('admin',))
 def admin_system_override():
-    action = (request.get_json(silent=True) or {}).get('action')
-    if action == 'LOCK': SYSTEM_STATE['LOCKDOWN_MODE'] = True
-    elif action == 'UNLOCK': SYSTEM_STATE['LOCKDOWN_MODE'] = False
-    return jsonify({"success": True, "message": f"System state shifted to {action}."})
+    # Verify caller is an admin WITHOUT going through require_staff(),
+    # so this endpoint still works while the system is in LOCKDOWN.
+    email = _normalize_email(request.headers.get('X-User-Email', ''))
+    if not email:
+        return json_error("Authentication required.", 401)
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT role FROM users WHERE LOWER(email)=%s", (email,))
+    row = cur.fetchone()
+    if not row or row['role'] != 'admin':
+        return json_error("Forbidden: admin only.", 403)
+
+    action = (request.get_json(silent=True) or {}).get('action', '').upper()
+    if action == 'LOCK':
+        SYSTEM_STATE['LOCKDOWN_MODE'] = True
+    elif action == 'UNLOCK':
+        SYSTEM_STATE['LOCKDOWN_MODE'] = False
+    else:
+        return json_error("Unknown action. Use LOCK or UNLOCK.", 400)
+    return jsonify({
+        "success": True,
+        "lockdown": SYSTEM_STATE['LOCKDOWN_MODE'],
+        "message": f"System state shifted to {action}."
+    })
 
 # =========================================================
 # 💸 BILLING 
