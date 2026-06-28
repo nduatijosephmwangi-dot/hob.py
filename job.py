@@ -1,14 +1,15 @@
 """
 =====================================================================
- Wambui Shadrack Associates — Legal Portal Backend (v2, production)
- Flask + PostgreSQL + M-Pesa Daraja STK Push + Stripe + Resend Email
+ Wambui Shadrack Associates — Legal Portal Backend (v3, production)
+ Flask + PostgreSQL + M-Pesa Daraja STK Push + Resend Email + Scheduler
 =====================================================================
 """
 import os
 import random
 import logging
 import base64
-from datetime import datetime
+import atexit
+from datetime import datetime, date, timedelta
 from functools import wraps
 import requests
 import psycopg2
@@ -18,17 +19,16 @@ from requests.auth import HTTPBasicAuth
 from flask import Flask, request, jsonify, g, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+from apscheduler.schedulers.background import BackgroundScheduler
 import stripe
 
 # =========================================================
 # ⚙️ APP CONFIG
 # =========================================================
 app = Flask(__name__)
-
-# Permissive CORS to ensure frontend connects without errors
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-app.config['DATABASE_URL'] = os.environ.get('DATABASE_URL')
+app.config['DATABASE_URL'] = os.environ.get('DATABASE_URL', 'dbname=postgres user=postgres password=jose1023 host=localhost port=5432')
 app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', './client_docs/')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
@@ -72,74 +72,73 @@ def init_db():
     init_pool()
     conn = DB_POOL.getconn()
     try:
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id SERIAL PRIMARY KEY,
-                full_name VARCHAR(255) NOT NULL,
-                phone_number VARCHAR(50) UNIQUE,
-                email VARCHAR(255) UNIQUE,
-                role VARCHAR(50) NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS otp_vault_email (
-                email VARCHAR(255) PRIMARY KEY,
-                code VARCHAR(6) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS cases (
-                case_id SERIAL PRIMARY KEY,
-                case_number VARCHAR(255) UNIQUE NOT NULL,
-                client_name VARCHAR(255),
-                case_parties VARCHAR(255),   
-                next_court_date VARCHAR(255),
-                coming_up_for TEXT,
-                total_balance NUMERIC(15,2) DEFAULT 0.00,
-                paid_balance NUMERIC(15,2) DEFAULT 0.00,
-                ai_access_granted BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS case_documents (
-                doc_id SERIAL PRIMARY KEY,
-                case_number VARCHAR(255) NOT NULL,
-                filename VARCHAR(500) NOT NULL,
-                original_name VARCHAR(500),
-                file_size BIGINT,
-                uploaded_by_role VARCHAR(50) NOT NULL,
-                uploaded_by_name VARCHAR(255),
-                visible_to_client BOOLEAN DEFAULT TRUE,
-                upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS ai_client_logs (
-                log_id SERIAL PRIMARY KEY,
-                case_number VARCHAR(255),
-                client_name VARCHAR(255),
-                actor VARCHAR(50),
-                question TEXT NOT NULL,
-                ai_response TEXT NOT NULL,
-                logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        
-        seed_users = [
-            ('Shadrack Wambui', '0700260086', 'shadrack@wambuishadrack.co.ke', 'admin'),
-            ('Jeff Kangethe',   '0704704758', 'jeff@wambuishadrack.co.ke',     'advocate'),
-            ('Jane Onyango',    '0795204923', 'jane@wambuishadrack.co.ke',     'secretary'),
-        ]
-        for name, phone, email, role in seed_users:
+        with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO users (full_name, phone_number, email, role)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (email) DO UPDATE SET role = EXCLUDED.role, full_name = EXCLUDED.full_name;
-            """, (name, phone, email, role))
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id SERIAL PRIMARY KEY,
+                    full_name VARCHAR(255) NOT NULL,
+                    phone_number VARCHAR(50) UNIQUE,
+                    email VARCHAR(255) UNIQUE,
+                    role VARCHAR(50) NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS otp_vault_email (
+                    email VARCHAR(255) PRIMARY KEY,
+                    code VARCHAR(6) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS cases (
+                    case_id SERIAL PRIMARY KEY,
+                    case_number VARCHAR(255) UNIQUE NOT NULL,
+                    client_name VARCHAR(255),
+                    case_parties VARCHAR(255),   
+                    next_court_date VARCHAR(255),
+                    coming_up_for TEXT,
+                    total_balance NUMERIC(15,2) DEFAULT 0.00,
+                    paid_balance NUMERIC(15,2) DEFAULT 0.00,
+                    ai_access_granted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS case_documents (
+                    doc_id SERIAL PRIMARY KEY,
+                    case_number VARCHAR(255) NOT NULL,
+                    filename VARCHAR(500) NOT NULL,
+                    original_name VARCHAR(500),
+                    file_size BIGINT,
+                    uploaded_by_role VARCHAR(50) NOT NULL,
+                    uploaded_by_name VARCHAR(255),
+                    visible_to_client BOOLEAN DEFAULT TRUE,
+                    upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS ai_client_logs (
+                    log_id SERIAL PRIMARY KEY,
+                    case_number VARCHAR(255),
+                    client_name VARCHAR(255),
+                    actor VARCHAR(50),
+                    question TEXT NOT NULL,
+                    ai_response TEXT NOT NULL,
+                    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            seed_users = [
+                ('Shadrack Wambui', '0700260086', 'shadrack@wambuishadrack.co.ke', 'admin'),
+                ('Jeff Kangethe',   '0704704758', 'jeff@wambuishadrack.co.ke',     'advocate'),
+                ('Jane Onyango',    '0795204923', 'jane@wambuishadrack.co.ke',     'secretary'),
+            ]
+            for name, phone, email, role in seed_users:
+                cur.execute("""
+                    INSERT INTO users (full_name, phone_number, email, role)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (email) DO UPDATE SET role = EXCLUDED.role, full_name = EXCLUDED.full_name;
+                """, (name, phone, email, role))
         conn.commit()
         logging.info("💾 Database schema synchronized.")
     except Exception as e:
         conn.rollback()
         logging.exception(f"DB init failure: {e}")
     finally:
-        cur.close()
         DB_POOL.putconn(conn)
 
 # =========================================================
@@ -168,9 +167,10 @@ def require_staff(roles=('admin', 'advocate', 'secretary')):
             email = _normalize_email(request.headers.get('X-User-Email', ''))
             if not email:
                 return json_error("Authentication required.", 401)
-            conn = get_db(); cur = conn.cursor()
-            cur.execute("SELECT role, full_name FROM users WHERE LOWER(email)=%s", (email,))
-            row = cur.fetchone()
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute("SELECT role, full_name FROM users WHERE LOWER(email)=%s", (email,))
+                row = cur.fetchone()
             if not row or row['role'] not in roles:
                 return json_error("Forbidden.", 403)
             g.current_user = {"email": email, "role": row['role'], "name": row['full_name']}
@@ -179,41 +179,102 @@ def require_staff(roles=('admin', 'advocate', 'secretary')):
     return deco
 
 # =========================================================
-# 📧 RESEND EMAIL
+# 📧 RESEND EMAIL ENGINE
 # =========================================================
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM = os.environ.get("RESEND_FROM", "onboarding@resend.dev")
 
-def send_otp_email(email: str, otp: str, name: str = ""):
+def send_generic_email(to_email: str, subject: str, html_body: str):
     if not RESEND_API_KEY:
-        return False, "RESEND_API_KEY missing"
+        logging.warning("Resend API key missing. Email not sent.")
+        return False
     try:
         r = requests.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "from": RESEND_FROM,
-                "to": [email],
-                "subject": "Wambui Shadrack Advocates — Verification Code",
-                "html": f"""
-                    <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;">
-                      <h2 style="color:#0a2540;">Wambui Shadrack &amp; Associates</h2>
-                      <p>Hello {name or 'Counsel'},</p>
-                      <p>Your secure verification code is:</p>
-                      <div style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#c9a961;
-                                  background:#f7f5ef;padding:16px;text-align:center;border-radius:8px;">
-                        {otp}
-                      </div>
-                      <p style="color:#666;font-size:13px;">This code expires in 10 minutes.</p>
-                    </div>
-                """,
-            },
+            json={"from": RESEND_FROM, "to": [to_email], "subject": subject, "html": html_body},
             timeout=15,
         )
-        if r.status_code in (200, 201): return True, "delivered"
-        return False, f"Resend API Error {r.status_code}"
+        return r.status_code in (200, 201)
     except Exception as e:
-        return False, f"Email exception: {e}"
+        logging.error(f"Email exception: {e}")
+        return False
+
+def send_otp_email(email: str, otp: str, name: str = ""):
+    html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;">
+            <h2 style="color:#0a2540;">Wambui Shadrack &amp; Associates</h2>
+            <p>Hello {name or 'Counsel'},</p>
+            <p>Your secure verification code is:</p>
+            <div style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#c9a961;
+                        background:#f7f5ef;padding:16px;text-align:center;border-radius:8px;">
+            {otp}
+            </div>
+            <p style="color:#666;font-size:13px;">This code expires in 10 minutes.</p>
+        </div>
+    """
+    return send_generic_email(email, "Wambui Shadrack Advocates — Verification Code", html)
+
+# =========================================================
+# ⏰ AUTOMATED 7-DAY REMINDER ENGINE
+# =========================================================
+def run_weekly_reminders():
+    """Hunts for cases exactly 7 days away and emails the staff."""
+    with app.app_context():
+        conn = DB_POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                target_date = (date.today() + timedelta(days=7)).strftime('%Y-%m-%d')
+                
+                # Fetch matters happening in exactly 7 days
+                cur.execute("""
+                    SELECT case_number, case_parties, coming_up_for 
+                    FROM cases 
+                    WHERE next_court_date = %s
+                """, (target_date,))
+                upcoming = cur.fetchall()
+                
+                if not upcoming:
+                    logging.info(f"[{datetime.now()}] No matters scheduled for {target_date}. No reminders sent.")
+                    return
+                
+                # Fetch staff emails
+                cur.execute("SELECT email FROM users WHERE role IN ('admin', 'advocate', 'secretary') AND email IS NOT NULL")
+                staff_emails = [row['email'] for row in cur.fetchall()]
+                
+                if not staff_emails: return
+
+                # Compile HTML Alert
+                html = f"""
+                <div style="font-family: Arial, sans-serif; max-width: 600px;">
+                    <h2 style="color: #c9a961;">Wambui Shadrack Associates - 7-Day Alert</h2>
+                    <p>Good morning. The following matters are scheduled for next week (<b>{target_date}</b>):</p>
+                    <hr>
+                """
+                for c in upcoming:
+                    parties = c.get('case_parties') or "Parties Not Listed"
+                    html += f"""
+                    <div style="margin-bottom: 15px; padding: 10px; background-color: #f8fafc; border-left: 4px solid #c9a961;">
+                        <p><strong>File:</strong> {c['case_number']}</p>
+                        <p><strong>Parties:</strong> {parties}</p>
+                        <p><strong>Action Required:</strong> {c.get('coming_up_for', 'N/A')}</p>
+                    </div>
+                    """
+                html += "</div>"
+
+                # Dispatch Email to all staff
+                for email in staff_emails:
+                    send_generic_email(email, f"🚨 Upcoming Hearings: {target_date}", html)
+                
+                logging.info(f"[{datetime.now()}] 7-Day Reminders sent for {target_date} to {len(staff_emails)} staff members.")
+        finally:
+            DB_POOL.putconn(conn)
+
+# Initialize Scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=run_weekly_reminders, trigger="cron", hour=6, minute=0) # Runs daily at 6:00 AM
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown())
 
 # =========================================================
 # 💰 M-PESA DARAJA
@@ -267,11 +328,6 @@ def initiate_stk_push(phone, amount, account_ref, description="Legal Fees"):
         return 500, {"error": str(e)}
 
 # =========================================================
-# 💳 STRIPE CONFIGURATION
-# =========================================================
-stripe.api_key = os.environ.get('STRIPE_SECRET_KEY', '')
-
-# =========================================================
 # 🔐 AUTH & OTP
 # =========================================================
 @app.route('/api/auth/login-router', methods=['POST'])
@@ -282,35 +338,39 @@ def login_router():
     credential = (payload.get('credential') or '').strip()
     if not credential: return json_error("Login field cannot be blank.")
     
+    conn = get_db()
     if '@' in credential:
         email = _normalize_email(credential)
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("SELECT full_name, role FROM users WHERE LOWER(email)=%s", (email,))
-        account = cur.fetchone()
+        with conn.cursor() as cur:
+            cur.execute("SELECT full_name, role FROM users WHERE LOWER(email)=%s", (email,))
+            account = cur.fetchone()
+        
         if not account: return json_error("Access denied: Not a registered staff member.", 403)
         
         otp = str(random.randint(100000, 999999))
-        cur.execute("""
-            INSERT INTO otp_vault_email (email, code, expires_at)
-            VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
-            ON CONFLICT (email) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at;
-        """, (email, otp))
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO otp_vault_email (email, code, expires_at)
+                VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
+                ON CONFLICT (email) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at;
+            """, (email, otp))
         conn.commit()
         
-        ok, info = send_otp_email(email, otp, account['full_name'])
-        logging.info(f"🔑 [SECURITY TESTING] GENERATED OTP FOR {email} IS: {otp} | Delivered: {ok} ({info})")
+        ok = send_otp_email(email, otp, account['full_name'])
+        logging.info(f"🔑 [SECURITY TESTING] GENERATED OTP FOR {email} IS: {otp} | Delivered: {ok}")
         
         return jsonify({
             "success": True, "mode": "otp_required", "role_preview": account['role'], 
             "message": f"Check your email for the verification code."
         })
     else:
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("""
-            SELECT case_number, client_name, case_parties, ai_access_granted, next_court_date, coming_up_for, total_balance, paid_balance
-            FROM cases WHERE LOWER(case_number) = LOWER(%s) LIMIT 1
-        """, (credential,))
-        case = cur.fetchone()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT case_number, client_name, case_parties, ai_access_granted, next_court_date, coming_up_for, total_balance, paid_balance
+                FROM cases WHERE LOWER(case_number) = LOWER(%s) LIMIT 1
+            """, (credential,))
+            case = cur.fetchone()
+            
         if not case: return json_error("No case found matching that reference.", 404)
         total, paid = float(case['total_balance'] or 0), float(case['paid_balance'] or 0)
         
@@ -319,7 +379,7 @@ def login_router():
             "data": {
                 "case_number": case['case_number'], 
                 "client_name" : case['client_name'],
-                "case_parties": case['case_parties'],
+                "case_parties": case.get('case_parties') or "Parties not established", # Enforces display in client portal
                 "next_court_date": case['next_court_date'], 
                 "coming_up_for": case['coming_up_for'],
                 "financials": {"total": total, "paid": paid, "balance": total - paid},
@@ -334,40 +394,20 @@ def verify_otp():
     code = (data.get('code') or '').strip()
     if not email or not code: return json_error("Identity parameters missing.")
         
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT code FROM otp_vault_email WHERE email=%s AND expires_at > NOW();", (email,))
-    rec = cur.fetchone()
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT code FROM otp_vault_email WHERE email=%s AND expires_at > NOW();", (email,))
+        rec = cur.fetchone()
+        
     if not rec or rec['code'] != code: return json_error("Invalid or Expired Security Token.", 401)
         
-    cur.execute("DELETE FROM otp_vault_email WHERE email=%s;", (email,))
-    cur.execute("SELECT full_name, role FROM users WHERE LOWER(email)=%s;", (email,))
-    prof = cur.fetchone()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM otp_vault_email WHERE email=%s;", (email,))
+        cur.execute("SELECT full_name, role FROM users WHERE LOWER(email)=%s;", (email,))
+        prof = cur.fetchone()
     conn.commit()
     
     return jsonify({"success": True, "email": email, "role": prof['role'], "user_name": prof['full_name']})
-
-@app.route('/api/auth/resend-otp', methods=['POST'])
-def resend_otp():
-    data = request.get_json(silent=True) or {}
-    email = _normalize_email(data.get('email') or data.get('phone') or '')
-    if not email: return json_error("Email missing.")
-    
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT full_name FROM users WHERE LOWER(email)=%s;", (email,))
-    account = cur.fetchone()
-    if not account: return json_error("Not a registered staff member.", 403)
-        
-    new_otp = str(random.randint(100000, 999999))
-    cur.execute("""
-        INSERT INTO otp_vault_email (email, code, expires_at)
-        VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
-        ON CONFLICT (email) DO UPDATE SET code=EXCLUDED.code, expires_at=EXCLUDED.expires_at;
-    """, (email, new_otp))
-    conn.commit()
-    
-    ok, info = send_otp_email(email, new_otp, account['full_name'])
-    logging.info(f"🔄 [SECURITY TESTING] RESENT OTP FOR {email} IS: {new_otp} | Delivered: {ok} ({info})")
-    return jsonify({"success": True, "message": "A fresh 6-digit access code has been issued."})
 
 # =========================================================
 # 📂 STAFF OPERATIONS 
@@ -378,33 +418,60 @@ def resend_otp():
 def list_or_search_cases():
     q = request.args.get('q') or (request.get_json(silent=True) or {}).get('query') or ''
     q = q.strip()
-    conn = get_db(); cur = conn.cursor()
+    conn = get_db()
     
-    if q:
-        like = f"%{q}%"
-        cur.execute("""
-            SELECT * FROM cases
-            WHERE case_number     ILIKE %s
-               OR client_name     ILIKE %s
-               OR case_parties    ILIKE %s
-               OR coming_up_for   ILIKE %s
-               OR next_court_date ILIKE %s
-            ORDER BY updated_at DESC
-        """, (like, like, like, like, like))
-    else:
-        cur.execute("SELECT * FROM cases ORDER BY updated_at DESC")
-    
-    raw_rows = cur.fetchall()
+    with conn.cursor() as cur:
+        if q:
+            like = f"%{q}%"
+            cur.execute("""
+                SELECT * FROM cases
+                WHERE case_number     ILIKE %s
+                   OR client_name     ILIKE %s
+                   OR case_parties    ILIKE %s
+                   OR coming_up_for   ILIKE %s
+                   OR next_court_date ILIKE %s
+                ORDER BY updated_at DESC
+            """, (like, like, like, like, like))
+        else:
+            # When the search bar is empty, it returns the entire firm roster
+            cur.execute("SELECT * FROM cases ORDER BY updated_at DESC")
+        
+        raw_rows = cur.fetchall()
+        
     clean_rows = []
     for r in raw_rows:
         c = dict(r)
         c['total_balance'] = float(c.get('total_balance') or 0.0)
         c['paid_balance'] = float(c.get('paid_balance') or 0.0)
+        c['case_parties'] = c.get('case_parties') or "N/A" # Enforce visibility
         if g.current_user['role'] != 'admin':
             c['total_balance'] = "RESTRICTED"
             c['paid_balance'] = "RESTRICTED"
         clean_rows.append(c)
     return jsonify({"success": True, "cases": clean_rows, "results": clean_rows})
+
+@app.route('/api/staff/upcoming', methods=['GET'])
+@require_staff()
+def upcoming_cases():
+    """Powers the staff dashboard feed showing all matters coming up in the next 7 days."""
+    conn = get_db()
+    today_str = date.today().strftime('%Y-%m-%d')
+    next_week_str = (date.today() + timedelta(days=7)).strftime('%Y-%m-%d')
+    
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT case_id, case_number, client_name, case_parties, coming_up_for, next_court_date
+            FROM cases
+            WHERE next_court_date >= %s AND next_court_date <= %s
+            ORDER BY next_court_date ASC
+        """, (today_str, next_week_str))
+        cases = cur.fetchall()
+        
+    # Ensure parties formatting
+    for c in cases:
+        c['case_parties'] = c.get('case_parties') or "Parties Not Listed"
+        
+    return jsonify({"success": True, "cases": cases})
 
 @app.route('/api/staff/add-matter', methods=['POST'])
 @require_staff()
@@ -414,18 +481,19 @@ def add_matter():
     if not case_number: return json_error("Case Reference Number is required.")
         
     is_admin = g.current_user['role'] == 'admin'
-    conn = get_db(); cur = conn.cursor()
+    conn = get_db()
     try:
-        cur.execute("""
-            INSERT INTO cases (case_number, client_name, case_parties, total_balance, paid_balance)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (
-            case_number,
-            data.get('client_name') or data.get('case_parties'),
-            data.get('case_parties') or data.get('client_name'),
-            float(data.get('total_balance') or 0) if is_admin else 0,
-            float(data.get('paid_balance') or 0) if is_admin else 0,
-        ))
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO cases (case_number, client_name, case_parties, total_balance, paid_balance)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (
+                case_number,
+                data.get('client_name') or data.get('case_parties'),
+                data.get('case_parties') or data.get('client_name'),
+                float(data.get('total_balance') or 0) if is_admin else 0,
+                float(data.get('paid_balance') or 0) if is_admin else 0,
+            ))
         conn.commit()
         return jsonify({"success": True, "message": "Registry Ledger Updated Successfully."})
     except psycopg2.IntegrityError:
@@ -450,8 +518,9 @@ def update_matter():
         
     sets.append("updated_at = CURRENT_TIMESTAMP")
     vals.append(case_number)
-    conn = get_db(); cur = conn.cursor()
-    cur.execute(f"UPDATE cases SET {', '.join(sets)} WHERE case_number = %s", vals)
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(f"UPDATE cases SET {', '.join(sets)} WHERE case_number = %s", vals)
     conn.commit()
     return jsonify({"success": True, "message": "Case File Modified Successfully."})
 
@@ -462,9 +531,11 @@ def update_matter():
 def list_docs():
     case_number = (request.args.get('case_number') or '').strip()
     if not case_number: return jsonify({"success": True, "files": []})
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT filename FROM case_documents WHERE case_number=%s ORDER BY upload_date DESC", (case_number,))
-    return jsonify({"success": True, "files": cur.fetchall()})
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT filename FROM case_documents WHERE case_number=%s ORDER BY upload_date DESC", (case_number,))
+        files = cur.fetchall()
+    return jsonify({"success": True, "files": files})
 
 @app.route('/api/documents/client-upload', methods=['POST'])
 @app.route('/api/documents/staff-upload', methods=['POST'])
@@ -478,8 +549,9 @@ def unified_upload():
     stored_name = f"{case_number.replace('/', '_')}__{stamp}__{safe_name}"
     file.save(os.path.join(app.config['UPLOAD_FOLDER'], stored_name))
     
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("INSERT INTO case_documents (case_number, filename, original_name, uploaded_by_role) VALUES (%s, %s, %s, 'system')", (case_number, stored_name, safe_name))
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO case_documents (case_number, filename, original_name, uploaded_by_role) VALUES (%s, %s, %s, 'system')", (case_number, stored_name, safe_name))
     conn.commit()
     return jsonify({"success": True, "message": "Document successfully ingested to secure storage."})
 
@@ -494,9 +566,10 @@ def download_doc(filename):
 @app.route('/api/system/metrics', methods=['GET'])
 @require_staff()
 def system_metrics():
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) as count FROM cases;"); cases_count = cur.fetchone()['count']
-    cur.execute("SELECT COUNT(*) as count FROM ai_client_logs;"); ai_count = cur.fetchone()['count']
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) as count FROM cases;"); cases_count = cur.fetchone()['count']
+        cur.execute("SELECT COUNT(*) as count FROM ai_client_logs;"); ai_count = cur.fetchone()['count']
     return jsonify({
         "success": True, "cloud_status": "SECURE" if not SYSTEM_STATE['LOCKDOWN_MODE'] else "ISOLATED",
         "live_metrics": {"total_requests": cases_count + ai_count, "failed_logins": 0, "ai_queries_processed": ai_count}
@@ -505,20 +578,22 @@ def system_metrics():
 @app.route('/api/staff/ai-monitoring', methods=['GET'])
 @require_staff()
 def ai_monitoring():
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT case_number, question FROM ai_client_logs ORDER BY logged_at DESC LIMIT 50")
-    return jsonify({"success": True, "logs": [{"case_number": r['case_number'], "client_question": r['question']} for r in cur.fetchall()]})
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT case_number, question FROM ai_client_logs ORDER BY logged_at DESC LIMIT 50")
+        logs = cur.fetchall()
+    return jsonify({"success": True, "logs": [{"case_number": r['case_number'], "client_question": r['question']} for r in logs]})
 
 @app.route('/api/admin/system-override', methods=['POST'])
 def admin_system_override():
-    # Verify caller is an admin WITHOUT going through require_staff(),
-    # so this endpoint still works while the system is in LOCKDOWN.
     email = _normalize_email(request.headers.get('X-User-Email', ''))
-    if not email:
-        return json_error("Authentication required.", 401)
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT role FROM users WHERE LOWER(email)=%s", (email,))
-    row = cur.fetchone()
+    if not email: return json_error("Authentication required.", 401)
+    
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT role FROM users WHERE LOWER(email)=%s", (email,))
+        row = cur.fetchone()
+    
     if not row or row['role'] != 'admin':
         return json_error("Forbidden: admin only.", 403)
 
@@ -551,8 +626,9 @@ def billing_ai_unlock():
         if status not in (200, 201):
             return json_error("M-Pesa transaction failed to initiate.", 400, details=resp)
 
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("UPDATE cases SET ai_access_granted=TRUE WHERE case_number=%s", (case_number,))
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE cases SET ai_access_granted=TRUE WHERE case_number=%s", (case_number,))
     conn.commit()
     return jsonify({"success": True, "message": "Transaction verified. AI framework unlocked."})
 
@@ -592,8 +668,13 @@ def ai_consult():
         except Exception as e:
             return json_error(f"AI Gateway failure: {e}", 502)
 
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("INSERT INTO ai_client_logs (case_number, question, ai_response) VALUES (%s, %s, %s)", (case_no, q, answer))
+    conn = get_db()
+    with conn.cursor() as cur:
+        # Fixed: Included missing actor column in the insert statement
+        cur.execute("""
+            INSERT INTO ai_client_logs (case_number, actor, question, ai_response) 
+            VALUES (%s, %s, %s, %s)
+        """, (case_no, actor, q, answer))
     conn.commit()
     return jsonify({"success": True, "engine": AI_MODEL, "answer": answer})
 
