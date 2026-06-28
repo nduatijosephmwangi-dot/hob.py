@@ -124,7 +124,7 @@ def init_db():
             
             seed_users = [
                 ('Shadrack Wambui', '0700260086', 'shadrack@wambuishadrack.co.ke', 'admin'),
-                ('Jeff Kangethe',   '0704704758', 'jeff@wambuishadrack.co.ke',     'advocate'),
+                ('Jeff Kangethe',   '0704704758', 'nduatijosephmwangi@gmail.com',     'advocate'),
                 ('Jane Onyango',    '0795204923', 'jane@wambuishadrack.co.ke',     'secretary'),
             ]
             for name, phone, email, role in seed_users:
