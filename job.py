@@ -544,5 +544,22 @@ def predict_case(case_id):
     return jsonify({"success": True, "probability": random.randint(70, 95), "rationale": "Strong constitutional backing under Kenyan Precedents."})
 
 with app.app_context(): init_db()
+@app.route('/api/staff/search', methods=['POST'])
+@require_staff()
+def staff_search():
+    data = request.get_json(silent=True) or {}
+    query = f"%{data.get('query', '')}%"
+    conn = get_db()
+    with conn.cursor() as cur:
+        # Adjust the SQL columns to match your 'cases' table structure
+        cur.execute("""
+            SELECT * FROM cases 
+            WHERE case_number ILIKE %s 
+            OR client_name ILIKE %s 
+            OR client_email ILIKE %s
+            OR case_parties ILIKE %s
+        """, (query, query, query, query))
+        results = cur.fetchall()
+    return jsonify({"success": True, "results": results})
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
