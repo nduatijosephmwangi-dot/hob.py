@@ -25,7 +25,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # ⚙️ APP CONFIG
 # =========================================================
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": "*"}})
 
 app.config['DATABASE_URL'] = os.environ.get('DATABASE_URL', 'dbname=postgres user=postgres password=jose1023 host=localhost port=5432')
 app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', './client_docs/')
@@ -544,22 +544,28 @@ def predict_case(case_id):
     return jsonify({"success": True, "probability": random.randint(70, 95), "rationale": "Strong constitutional backing under Kenyan Precedents."})
 
 with app.app_context(): init_db()
-@app.route('/api/staff/search', methods=['POST'])
+@app.route('/api/staff/search', methods=['GET'])
 @require_staff()
-def staff_search():
-    data = request.get_json(silent=True) or {}
-    query = f"%{data.get('query', '')}%"
+def list_or_search_cases():
+    q = request.args.get('q', '').strip()
     conn = get_db()
     with conn.cursor() as cur:
-        # Adjust the SQL columns to match your 'cases' table structure
-        cur.execute("""
-            SELECT * FROM cases 
-            WHERE case_number ILIKE %s 
-            OR client_name ILIKE %s 
-            OR client_email ILIKE %s
-            OR case_parties ILIKE %s
-        """, (query, query, query, query))
-        results = cur.fetchall()
-    return jsonify({"success": True, "results": results})
+        if q:
+            like = f"%{q}%"
+            cur.execute("""
+                SELECT * FROM cases 
+                WHERE case_number ILIKE %s 
+                OR client_name ILIKE %s 
+                OR client_email ILIKE %s
+                OR case_parties ILIKE %s 
+                ORDER BY updated_at DESC
+            """, (like, like, like, like))
+        else:
+            cur.execute("SELECT * FROM cases ORDER BY updated_at DESC")
+        raw_rows = cur.fetchall()
+    
+    # Ensure we always return an array, even if empty
+    cases_list = [dict(r) for r in raw_rows] if raw_rows else []
+    return jsonify({"success": True, "cases": cases_list})
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
