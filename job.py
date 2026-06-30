@@ -411,19 +411,6 @@ def update_staff_matter(case_id):
     conn.commit()
     return jsonify({"success": True})
 
-@app.route('/api/staff/search', methods=['GET'])
-@require_staff()
-def list_or_search_cases():
-    q = request.args.get('q', '').strip()
-    conn = get_db()
-    with conn.cursor() as cur:
-        if q:
-            like = f"%{q}%"
-            cur.execute("SELECT * FROM cases WHERE case_number ILIKE %s OR client_name ILIKE %s OR case_parties ILIKE %s ORDER BY updated_at DESC", (like, like, like))
-        else:
-            cur.execute("SELECT * FROM cases ORDER BY updated_at DESC")
-        raw_rows = cur.fetchall()
-    return jsonify({"success": True, "cases": [dict(r) for r in raw_rows]})
 
 # =========================================================
 # 🗂️ SECURE DOCUMENT HANDLING
