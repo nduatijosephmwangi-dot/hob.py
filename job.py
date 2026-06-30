@@ -25,15 +25,47 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # ⚙️ APP CONFIG
 # =========================================================
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": "*"}})
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "X-User-Email", "X-User-Role"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    supports_credentials=False,
+)
 
-app.config['DATABASE_URL'] = os.environ.get('DATABASE_URL', 'dbname=postgres user=postgres password=jose1023 host=localhost port=5432')
+@app.after_request
+def _ensure_cors_headers(resp):
+    # Belt-and-suspenders: guarantees every response (including OPTIONS preflight)
+    # carries the right CORS headers even on routes that only declare GET/POST/PUT —
+    # the classic cause of a preflight coming back as a 405.
+    resp.headers.setdefault('Access-Control-Allow-Origin', '*')
+    resp.headers.setdefault('Access-Control-Allow-Headers', 'Content-Type, X-User-Email, X-User-Role')
+    resp.headers.setdefault('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+    return resp
+
+_raw_db_url = os.environ.get('DATABASE_URL', '')
+if not _raw_db_url:
+    # Fail loudly at boot instead of silently trying localhost and breaking every route later.
+    logging.error("❌ DATABASE_URL environment variable is NOT set. Set it on Render to your Neon connection string.")
+if _raw_db_url and 'neon.tech' in _raw_db_url and 'sslmode' not in _raw_db_url:
+    # Neon requires SSL; auto-append it so a missing query param doesn't silently break every DB call.
+    sep = '&' if '?' in _raw_db_url else '?'
+    _raw_db_url = f"{_raw_db_url}{sep}sslmode=require"
+app.config['DATABASE_URL'] = _raw_db_url or 'dbname=postgres user=postgres password=jose1023 host=localhost port=5432'
 app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', './client_docs/')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 SYSTEM_STATE = {"LOCKDOWN_MODE": False}
+
+@app.errorhandler(Exception)
+def _handle_uncaught(e):
+    # Without this, a DB/connection failure bubbles up as Flask's default HTML 500
+    # page, which safeFetch's r.json().catch(()=>({})) silently swallows into {} —
+    # exactly what makes failures look like mystery, message-less 401/405s.
+    logging.exception(f"Unhandled error on {request.method} {request.path}: {e}")
+    return jsonify({"success": False, "message": f"Server error: {e}"}), 500
 
 # =========================================================
 # 🗄️ DATABASE CONNECTION POOL
@@ -43,12 +75,16 @@ DB_POOL = None
 def init_pool():
     global DB_POOL
     if DB_POOL is None:
-        DB_POOL = pgpool.ThreadedConnectionPool(
-            minconn=1, maxconn=10,
-            dsn=app.config['DATABASE_URL'],
-            cursor_factory=RealDictCursor
-        )
-        logging.info("✅ PostgreSQL pool initialized")
+        try:
+            DB_POOL = pgpool.ThreadedConnectionPool(
+                minconn=1, maxconn=int(os.environ.get('DB_POOL_MAXCONN', 20)),
+                dsn=app.config['DATABASE_URL'],
+                cursor_factory=RealDictCursor
+            )
+            logging.info("✅ PostgreSQL pool initialized")
+        except Exception as e:
+            logging.exception(f"❌ Could not initialize DB pool — check DATABASE_URL / Neon credentials: {e}")
+            raise
 
 def get_db():
     if 'db' not in g:
@@ -446,6 +482,16 @@ def download_doc(filename):
 @app.route('/api/system/status', methods=['GET'])
 def system_status_check():
     return jsonify({"success": True, "locked": SYSTEM_STATE['LOCKDOWN_MODE']})
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return jsonify({"success": True, "db": "connected"})
+    except Exception as e:
+        return jsonify({"success": False, "db": "FAILED", "error": str(e)}), 500
 
 @app.route('/api/admin/lockdown', methods=['POST'])
 def admin_portal_lockdown():
