@@ -39,7 +39,7 @@ logging.basicConfig(
 
 # Resend Email Configuration
 resend.api_key = os.environ.get('RESEND_API_KEY', 're_dummy_key_replace_in_production')
-FIRM_EMAIL = "shdrackwambui@gmail.com" # Central firm email for notifications
+FIRM_EMAIL = "nduatijosephmwangi@gmail.com" # Central firm email for notifications
 
 # In-Memory Security State & Router Store
 SYSTEM_STATE = {
@@ -66,6 +66,21 @@ def close_db(e):
 
 def init_db():
     try:
+        # Safely attempt to add new columns if the table already existed
+        try:
+            cur.execute("ALTER TABLE cases ADD COLUMN staff_uploaded_doc TEXT;")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback() # Column exists, ignore error
+        else:
+            conn.commit()
+
+        # ---> NEW CODE: Add OTP column to users table <---
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN current_otp VARCHAR(10);")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback() 
+        else:
+            conn.commit()
         conn = db_pool.getconn()
         cur = conn.cursor()
         
@@ -245,13 +260,14 @@ def initiate_staff_login(credential):
         
         otp = str(random.randint(100000, 999999))
         identifier = account['email'] or account['phone_number']
-        SYSTEM_STATE["OTP_STORE"][identifier] = {"code": otp, "user": account}
         
-        # Log to terminal
+        # ---> NEW CODE: Save OTP to the PostgreSQL database, not SYSTEM_STATE <---
+        cur.execute("UPDATE users SET current_otp = %s WHERE email = %s OR phone_number = %s", (otp, identifier, identifier))
+        conn.commit()
+        
         print(f"\n📡 [SMS/EMAIL UTILITY LOG] Token Dispatch for {account['full_name']} -> {otp}\n")
         logging.info(f"OTP generated successfully for staff: {identifier}")
         
-        # Actually send the OTP via Resend
         if account['email']:
             email_html = f"""
             <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
@@ -274,19 +290,29 @@ def verify_otp():
     identifier = data.get('identifier', '').strip()
     code = data.get('code', '').strip()
     
-    record = SYSTEM_STATE["OTP_STORE"].get(identifier)
-    if not record or record['code'] != code:
-        return jsonify({"success": False, "message": "Invalid or expired verification token signature."}), 401
-    
-    SYSTEM_STATE["OTP_STORE"].pop(identifier, None)
-    
-    return jsonify({
-        "success": True,
-        "role": record['user']['role'], 
-        "user_name": record['user']['full_name'],    
-        "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
-    })
-
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # ---> NEW CODE: Check the database for the OTP <---
+        cur.execute("SELECT full_name, role, current_otp FROM users WHERE email = %s OR phone_number = %s", (identifier, identifier))
+        account = cur.fetchone()
+        
+        if not account or account['current_otp'] != code:
+            return jsonify({"success": False, "message": "Invalid or expired verification token signature."}), 401
+        
+        # Clear the OTP after successful login for security
+        cur.execute("UPDATE users SET current_otp = NULL WHERE email = %s OR phone_number = %s", (identifier, identifier))
+        conn.commit()
+        
+        return jsonify({
+            "success": True,
+            "role": account['role'], 
+            "user_name": account['full_name'],    
+            "lockdown_status": SYSTEM_STATE.get("LOCKDOWN_MODE", False)
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Database verification error: {str(e)}"}), 500
 def client_login(case_number):
     try:
         conn = get_db()
