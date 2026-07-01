@@ -152,18 +152,20 @@ def init_db():
 # 📧 EMAIL NOTIFICATION HELPER
 # =========================================================
 
-def send_firm_email(subject, html_content):
+def send_firm_email(subject, html_content, to_email=FIRM_EMAIL):
     """Secure background email dispatcher using Resend."""
     try:
         resend.Emails.send({
-            "from": "notifications@globallaga.com", # Update with your verified Resend domain
-            "to": FIRM_EMAIL,
+            # Note: If domain is not verified, use "onboarding@resend.dev"
+            "from": "onboarding@resend.dev", 
+            "to": to_email,
             "subject": subject,
             "html": html_content
         })
-        logging.info(f"Email Dispatched: {subject}")
+        logging.info(f"Email Dispatched: {subject} to {to_email}")
     except Exception as e:
         logging.error(f"Failed to send email via Resend: {str(e)}")
+        print(f"RESEND ERROR: {str(e)}")
 
 # =========================================================
 # 🛡️ SECURITY MIDDLEWARE & OBSERVABILITY (THE CYBER KILL SWITCH)
@@ -245,8 +247,22 @@ def initiate_staff_login(credential):
         identifier = account['email'] or account['phone_number']
         SYSTEM_STATE["OTP_STORE"][identifier] = {"code": otp, "user": account}
         
+        # Log to terminal
         print(f"\n📡 [SMS/EMAIL UTILITY LOG] Token Dispatch for {account['full_name']} -> {otp}\n")
         logging.info(f"OTP generated successfully for staff: {identifier}")
+        
+        # Actually send the OTP via Resend
+        if account['email']:
+            email_html = f"""
+            <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
+                <h3>Wambui Shadrack & Associates Portal</h3>
+                <p>Hello {account['full_name']},</p>
+                <p>Your secure access verification code is:</p>
+                <h1 style="color: #4CAF50; letter-spacing: 5px;">{otp}</h1>
+                <p><small>Do not share this code with anyone. It expires shortly.</small></p>
+            </div>
+            """
+            send_firm_email("Your Secure Portal OTP", email_html, to_email=account['email'])
         
         return jsonify({"success": True, "mode": "otp_required", "identifier": identifier, "message": "Verification code dispatched securely."})
     except Exception as e:
