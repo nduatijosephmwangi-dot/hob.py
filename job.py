@@ -1,9 +1,3 @@
-"""
-=====================================================================
- Wambui Shadrack Associates — Legal Portal Backend (v3, production)
- Flask + PostgreSQL + M-Pesa Daraja STK Push + Resend Email + Scheduler
-=====================================================================
-"""
 import os
 import random
 import logging
@@ -39,12 +33,12 @@ logging.basicConfig(
 
 # Resend Email Configuration
 resend.api_key = os.environ.get('RESEND_API_KEY', 're_dummy_key_replace_in_production')
-FIRM_EMAIL = "nduatijosephmwangi@gmail.com" # Central firm email for notifications
+FIRM_EMAIL = "shdrackwambui@gmail.com" # Central firm email for notifications
 
 # In-Memory Security State & Router Store
 SYSTEM_STATE = {
     "LOCKDOWN_MODE": False,
-    "OTP_STORE": {}
+    "AUTH_STORE": {}
 }
 
 # =========================================================
@@ -54,26 +48,8 @@ SYSTEM_STATE = {
 db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, app.config['DATABASE_URL'])
 
 def get_db():
-    """ 
-    Safely retrieves a database connection.
-    Includes retry logic to fix the "SSL connection has been closed" error
-    caused by the serverless DB dropping idle connections.
-    """
     if 'db' not in g:
-        for attempt in range(3):
-            try:
-                conn = db_pool.getconn()
-                # Ping the database to ensure the SSL connection is still alive
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                g.db = conn
-                break
-            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                # The connection dropped; remove it and try again
-                db_pool.putconn(conn, close=True)
-                if attempt == 2:
-                    logging.error(f"Database connection failed after 3 attempts: {str(e)}")
-                    raise e
+        g.db = db_pool.getconn()
     return g.db
 
 @app.teardown_appcontext
@@ -122,13 +98,6 @@ def init_db():
         else:
             conn.commit()
 
-        try:
-            cur.execute("ALTER TABLE users ADD COLUMN current_otp VARCHAR(10);")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback() 
-        else:
-            conn.commit()
-
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ai_client_logs (
                 log_id SERIAL PRIMARY KEY,
@@ -152,12 +121,12 @@ def init_db():
         
         cur.execute("""
             INSERT INTO users (full_name, phone_number, email, role) 
-            VALUES ('Wambui Shadrack', '0711223344', 'nduatijosephmwangi@gmail.com', 'admin') 
+            VALUES ('Wambui Shadrack', '0711223344', 'shdrackwambui@gmail.com', 'admin') 
             ON CONFLICT DO NOTHING;
         """)
         cur.execute("""
             INSERT INTO users (full_name, phone_number, email, role) 
-            VALUES ('Jeff Kangethe', '0796178783', 'jeff@globallaga.com', 'advocate') 
+            VALUES ('Jeff Kangethe', '0722334455', 'jeff@globallaga.com', 'advocate') 
             ON CONFLICT DO NOTHING;
         """)
         cur.execute("""
@@ -177,19 +146,18 @@ def init_db():
 # 📧 EMAIL NOTIFICATION HELPER
 # =========================================================
 
-def send_firm_email(subject, html_content, to_email=FIRM_EMAIL):
+def send_firm_email(subject, html_content):
     """Secure background email dispatcher using Resend."""
     try:
         resend.Emails.send({
-            "from": "onboarding@resend.dev", 
-            "to": to_email,
+            "from": "notifications@globallaga.com", # Update with your verified Resend domain
+            "to": FIRM_EMAIL,
             "subject": subject,
             "html": html_content
         })
-        logging.info(f"Email Dispatched: {subject} to {to_email}")
+        logging.info(f"Email Dispatched: {subject}")
     except Exception as e:
         logging.error(f"Failed to send email via Resend: {str(e)}")
-        print(f"RESEND ERROR: {str(e)}")
 
 # =========================================================
 # 🛡️ SECURITY MIDDLEWARE & OBSERVABILITY (THE CYBER KILL SWITCH)
@@ -201,7 +169,7 @@ def cyber_security_check():
         logging.info(f"API HIT: {request.remote_addr} accessed {request.endpoint}")
 
     if SYSTEM_STATE["LOCKDOWN_MODE"]:
-        allowed_routes = ['login_router', 'verify_otp', 'toggle_kill_switch']
+        allowed_routes = ['login_router', 'verify_password', 'toggle_kill_switch']
         if request.endpoint not in allowed_routes:
             logging.warning(f"BLOCKED REQUEST: Unauthorized access attempt to '{request.endpoint}'.")
             return jsonify({
@@ -257,78 +225,57 @@ def initiate_staff_login(credential):
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
-        identifier = credential.lower()
-        
-        if '@' in identifier:
-            # Added LOWER() to prevent 404 Case Sensitivity issues
-            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE LOWER(email) = %s", (identifier,))
+        if '@' in credential:
+            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE email = %s", (credential,))
         else:
             cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE phone_number = %s", (credential,))
             
         account = cur.fetchone()
         
         if not account:
-            return jsonify({"success": False, "message": "Access Denied: Credential is not registered as active staff."}), 404
+            return jsonify({"success": False, "message": "Access Denied: Credential is not registered as active staff."}), 403
         
-        otp = str(random.randint(100000, 999999))
+        # Generate the secure backend password string
+        generated_password = str(random.randint(100000, 999999))
+        identifier = account['email'] or account['phone_number']
+        SYSTEM_STATE["AUTH_STORE"][identifier] = {"code": generated_password, "user": account}
         
-        # Save OTP to the PostgreSQL database securely
-        if '@' in identifier:
-            cur.execute("UPDATE users SET current_otp = %s WHERE LOWER(email) = %s", (otp, identifier))
-        else:
-            cur.execute("UPDATE users SET current_otp = %s WHERE phone_number = %s", (otp, credential))
-            
-        conn.commit()
+        # Clean terminal logging for standard local debug output
+        print(f"\n📡 [SECURITY UTILITY LOG] Generated Password for {account['full_name']} ({account['role']}) -> {generated_password}\n")
+        logging.info(f"Backend password generated successfully for staff identifier: {identifier}")
         
-        print(f"\n📡 [SMS/EMAIL UTILITY LOG] Token Dispatch for {account['full_name']} -> {otp}\n")
-        logging.info(f"OTP generated successfully for staff: {identifier}")
-        
-        if account['email']:
-            email_html = f"""
-            <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
-                <h3>Wambui Shadrack & Associates Portal</h3>
-                <p>Hello {account['full_name']},</p>
-                <p>Your secure access verification code is:</p>
-                <h1 style="color: #4CAF50; letter-spacing: 5px;">{otp}</h1>
-                <p><small>Do not share this code with anyone. It expires shortly.</small></p>
-            </div>
-            """
-            send_firm_email("Your Secure Portal OTP", email_html, to_email=account['email'])
-        
-        return jsonify({"success": True, "mode": "otp_required", "identifier": credential, "message": "Verification code dispatched securely."})
+        # Explicitly pass down 'role' and change mode to 'password_required'
+        return jsonify({
+            "success": True, 
+            "mode": "password_required", 
+            "role": account['role'], 
+            "identifier": identifier, 
+            "message": "Staff signature validated. Enter system-generated access key."
+        })
     except Exception as e:
         return jsonify({"success": False, "message": f"Server Authentication Fault: {str(e)}"}), 500
 
-@app.route('/api/auth/verify-otp', methods=['POST'])
-def verify_otp():
+@app.route('/api/auth/verify-password', methods=['POST'])
+def verify_password():
     data = request.get_json() or {}
-    identifier = data.get('identifier', '').strip().lower()
-    code = data.get('code', '').strip()
+    identifier = data.get('identifier', '').strip()
+    password = data.get('password', '').strip()
     
-    try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Search safely using LOWER() to guarantee a match
-        cur.execute("SELECT full_name, role, current_otp FROM users WHERE LOWER(email) = %s OR phone_number = %s", (identifier, data.get('identifier', '').strip()))
-        account = cur.fetchone()
-        
-        # Strictly compare strings to avoid Invalid Token Signature errors
-        if not account or str(account['current_otp']) != str(code):
-            return jsonify({"success": False, "message": "Invalid verification token signature."}), 401
-        
-        # Clear the OTP after successful login for security
-        cur.execute("UPDATE users SET current_otp = NULL WHERE LOWER(email) = %s OR phone_number = %s", (identifier, data.get('identifier', '').strip()))
-        conn.commit()
-        
-        return jsonify({
-            "success": True,
-            "role": account['role'], 
-            "user_name": account['full_name'],    
-            "lockdown_status": SYSTEM_STATE.get("LOCKDOWN_MODE", False)
-        })
-    except Exception as e:
-        return jsonify({"success": False, "message": f"Database verification error: {str(e)}"}), 500
+    record = SYSTEM_STATE["AUTH_STORE"].get(identifier)
+    if not record or record['code'] != password:
+        logging.warning(f"FAILED LOGIN ATTEMPT: Invalid password entry signature for {identifier}")
+        return jsonify({"success": False, "message": "Invalid or expired access password signature."}), 401
+    
+    # Destructure entry to prevent reuse attacks
+    SYSTEM_STATE["AUTH_STORE"].pop(identifier, None)
+    logging.info(f"SUCCESSFUL LOGIN: {record['user']['full_name']} signed in via backend security gateway.")
+    
+    return jsonify({
+        "success": True,
+        "role": record['user']['role'], 
+        "user_name": record['user']['full_name'],    
+        "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
+    })
 
 def client_login(case_number):
     try:
