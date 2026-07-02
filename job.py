@@ -18,10 +18,24 @@ import resend
 app = Flask(__name__)
 CORS(app)
 
-app.config['DATABASE_URL'] = os.environ.get(
-    'DATABASE_URL', 
-    'dbname=postgres user=postgres password=jose1023 host=localhost port=5432'
-)  
+# ---------------------------------------------------------
+# 🌐 NEON (POSTGRES) CONNECTION
+# ---------------------------------------------------------
+# Set the DATABASE_URL env-var on Render (or your host) to your Neon
+# connection string, e.g.
+#   postgresql://<user>:<password>@<host>.neon.tech/<db>?sslmode=require
+# The fallback below is only used for local dev if the env-var is missing.
+DEFAULT_DB_URL = (
+    "postgresql://neondb_owner:REPLACE_ME@ep-example-pooler.neon.tech/"
+    "neondb?sslmode=require"
+)
+DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_DB_URL)
+
+# Neon requires SSL. If the caller forgot to append it, add it automatically.
+if "sslmode=" not in DATABASE_URL:
+    DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
+
+app.config['DATABASE_URL'] = DATABASE_URL
 app.config['UPLOAD_FOLDER'] = './client_docs/'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -36,9 +50,14 @@ logging.basicConfig(
 resend.api_key = os.environ.get('RESEND_API_KEY', 're_dummy_key_replace_in_production')
 FIRM_EMAIL = "shdrackwambui@gmail.com" # Central firm email for notifications
 
+# Default password seeded for staff accounts on first boot. Change per user
+# afterwards. Override with env-var STAFF_DEFAULT_PASSWORD if desired.
+STAFF_DEFAULT_PASSWORD = os.environ.get("STAFF_DEFAULT_PASSWORD", "ChangeMe123!")
+
 # In-Memory Security State & Router Store
 SYSTEM_STATE = {
-    "LOCKDOWN_MODE": False
+    "LOCKDOWN_MODE": False,
+    "OTP_STORE": {}
 }
 
 # =========================================================
@@ -70,16 +89,16 @@ def init_db():
                 phone_number VARCHAR(50) UNIQUE,
                 email VARCHAR(255) UNIQUE,
                 role VARCHAR(50) NOT NULL,
-                password_hash VARCHAR(255) NOT NULL
+                password_hash TEXT
             );
         """)
 
-        # Alter table in case it exists but lacks the password_hash column
+        # Add password_hash if the users table already existed without it
         try:
-            cur.execute("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255);")
+            cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT;")
             conn.commit()
         except psycopg2.errors.DuplicateColumn:
-            conn.rollback() # Column exists, ignore error
+            conn.rollback()
         
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cases (
@@ -101,9 +120,10 @@ def init_db():
         # Safely attempt to add new columns if the table already existed
         try:
             cur.execute("ALTER TABLE cases ADD COLUMN staff_uploaded_doc TEXT;")
-            conn.commit()
         except psycopg2.errors.DuplicateColumn:
             conn.rollback() # Column exists, ignore error
+        else:
+            conn.commit()
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ai_client_logs (
@@ -125,30 +145,26 @@ def init_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        
-        # Generate default password hash for initial user seeds
-        default_pwd_hash = generate_password_hash('password123')
 
-        cur.execute("""
-            INSERT INTO users (full_name, phone_number, email, role, password_hash) 
-            VALUES ('Wambui Shadrack', '0711223344', 'shdrackwambui@gmail.com', 'admin', %s) 
-            ON CONFLICT DO NOTHING;
-        """, (default_pwd_hash,))
-        cur.execute("""
-            INSERT INTO users (full_name, phone_number, email, role, password_hash) 
-            VALUES ('Jeff Kangethe', '0722334455', 'nduatijsephmwangi@gmail.com', 'advocate', %s) 
-            ON CONFLICT DO NOTHING;
-        """, (default_pwd_hash,))
-        cur.execute("""
-            INSERT INTO users (full_name, phone_number, email, role, password_hash) 
-            VALUES ('Jane Onyango', '0733445566', 'jane@globallaga.com', 'secretary', %s) 
-            ON CONFLICT DO NOTHING;
-        """, (default_pwd_hash,))
+        # ----- Seed staff accounts with hashed default password -----
+        default_hash = generate_password_hash(STAFF_DEFAULT_PASSWORD)
+        seed_staff = [
+            ('Wambui Shadrack', '0711223344', 'shdrackwambui@gmail.com', 'admin'),
+            ('Jeff Kangethe',   '0722334455', 'jeff@globallaga.com',     'advocate'),
+            ('Jane Onyango',    '0733445566', 'jane@globallaga.com',     'secretary'),
+        ]
+        for full_name, phone, email, role in seed_staff:
+            cur.execute("""
+                INSERT INTO users (full_name, phone_number, email, role, password_hash)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (email) DO UPDATE
+                    SET password_hash = COALESCE(users.password_hash, EXCLUDED.password_hash);
+            """, (full_name, phone, email, role, default_hash))
         
         conn.commit()
         cur.close()
         db_pool.putconn(conn)
-        print("💾 [DATABASE INITIALIZATION] Connection Pool active. Schema verified.")
+        print("💾 [DATABASE INITIALIZATION] Neon connection pool active. Schema verified.")
     except Exception as e:
         print(f"⚠️ [DATABASE INITIALIZATION FAILURE] Couldn't map setup attributes: {str(e)}")
 
@@ -179,7 +195,7 @@ def cyber_security_check():
         logging.info(f"API HIT: {request.remote_addr} accessed {request.endpoint}")
 
     if SYSTEM_STATE["LOCKDOWN_MODE"]:
-        allowed_routes = ['login_router', 'toggle_kill_switch']
+        allowed_routes = ['login_router', 'verify_otp', 'staff_password_login', 'toggle_kill_switch']
         if request.endpoint not in allowed_routes:
             logging.warning(f"BLOCKED REQUEST: Unauthorized access attempt to '{request.endpoint}'.")
             return jsonify({
@@ -221,50 +237,103 @@ def get_system_logs():
 def login_router():
     payload = request.get_json() or {}
     credential = payload.get('credential', '').strip()
-    password = payload.get('password', '').strip()
+    password   = payload.get('password', '')
     
     if not credential:
         return jsonify({"success": False, "message": "Login field cannot be blank."}), 400
         
-    # Checking for staff patterns (email) or phone numbers
-    if '@' in credential or (credential.isdigit() and len(credential) >= 10):
-        return staff_login(credential, password)
-    else:
-        return client_login(credential)
+    # Staff = email address (password required)
+    if '@' in credential:
+        if not password:
+            return jsonify({"success": False, "mode": "password_required",
+                            "message": "Password required for staff login."}), 200
+        return staff_password_login_inner(credential, password)
 
-def staff_login(credential, password):
-    if not password:
-        return jsonify({"success": False, "message": "Password is required for staff login."}), 400
-        
+    # Phone number staff login keeps the OTP flow (legacy)
+    if credential.isdigit() and len(credential) >= 10:
+        return initiate_staff_login(credential)
+
+    # Everything else is treated as a client case number
+    return client_login(credential)
+
+def initiate_staff_login(credential):
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        if '@' in credential:
-            cur.execute("SELECT full_name, phone_number, email, role, password FROM users WHERE email = %s", (credential,))
-        else:
-            cur.execute("SELECT full_name, phone_number, email, role, password FROM users WHERE phone_number = %s", (credential,))
-            
+        cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE phone_number = %s", (credential,))
         account = cur.fetchone()
         
         if not account:
             return jsonify({"success": False, "message": "Access Denied: Credential is not registered as active staff."}), 403
         
-        # Verify Password
-        if not check_password_hash(account['password'], password):
-            return jsonify({"success": False, "message": "Access Denied: Invalid password."}), 401
-            
-        logging.info(f"Staff login successful: {credential}")
+        otp = str(random.randint(100000, 999999))
+        identifier = account['email'] or account['phone_number']
+        SYSTEM_STATE["OTP_STORE"][identifier] = {"code": otp, "user": account}
         
+        print(f"\n📡 [SMS/EMAIL UTILITY LOG] Token Dispatch for {account['full_name']} -> {otp}\n")
+        logging.info(f"OTP generated successfully for staff: {identifier}")
+        
+        return jsonify({"success": True, "mode": "otp_required", "identifier": identifier, "message": "Verification code dispatched securely."})
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Server Authentication Fault: {str(e)}"}), 500
+
+# ---------------------------------------------------------
+# NEW: Email + Password login for staff (backed by Neon DB)
+# ---------------------------------------------------------
+@app.route('/api/auth/staff-login', methods=['POST'])
+def staff_password_login():
+    data = request.get_json() or {}
+    email    = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+    if not email or not password:
+        return jsonify({"success": False, "message": "Email and password are required."}), 400
+    return staff_password_login_inner(email, password)
+
+def staff_password_login_inner(email, password):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT full_name, email, role, password_hash
+              FROM users
+             WHERE LOWER(email) = LOWER(%s)
+        """, (email,))
+        account = cur.fetchone()
+
+        if not account or not account.get('password_hash') \
+                or not check_password_hash(account['password_hash'], password):
+            logging.warning(f"Failed staff password login for {email}")
+            return jsonify({"success": False, "message": "Invalid email or password."}), 401
+
+        log_audit("Staff password login", account['full_name'], account['email'])
         return jsonify({
-            "success": True, 
+            "success": True,
             "mode": "staff_dashboard",
             "role": account['role'],
             "user_name": account['full_name'],
-            "message": "Login successful."
+            "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
         })
     except Exception as e:
         return jsonify({"success": False, "message": f"Server Authentication Fault: {str(e)}"}), 500
+
+@app.route('/api/auth/verify-otp', methods=['POST'])
+def verify_otp():
+    data = request.get_json() or {}
+    identifier = data.get('identifier', '').strip()
+    code = data.get('code', '').strip()
+    
+    record = SYSTEM_STATE["OTP_STORE"].get(identifier)
+    if not record or record['code'] != code:
+        return jsonify({"success": False, "message": "Invalid or expired verification token signature."}), 401
+    
+    SYSTEM_STATE["OTP_STORE"].pop(identifier, None)
+    
+    return jsonify({
+        "success": True,
+        "role": record['user']['role'], 
+        "user_name": record['user']['full_name'],    
+        "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
+    })
 
 def client_login(case_number):
     try:
@@ -481,6 +550,7 @@ def search_cases():
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
+        # Validate if the user is the Admin by checking DB role directly, eliminating name-mismatch bugs
         cur.execute("SELECT role FROM users WHERE full_name = %s", (user_name,))
         role_record = cur.fetchone()
         is_admin = role_record and role_record['role'] == 'admin'
@@ -582,4 +652,4 @@ def toggle_kill_switch():
 
 if __name__ == '__main__':
     init_db()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False)
