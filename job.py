@@ -43,14 +43,14 @@ FIRM_EMAIL = "nduatijosephmwangi@gmail.com" # Central firm email for notificatio
 
 # In-Memory Security State & Router Store
 SYSTEM_STATE = {
-    "LOCKDOWN_MODE": False
+    "LOCKDOWN_MODE": False,
+    "OTP_STORE": {}
 }
 
 # =========================================================
 # 🗄️ DATABASE CONNECTION POOLING & AUTO-INITIALIZATION
 # =========================================================
 
-# Initialize the connection pool globally
 db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, app.config['DATABASE_URL'])
 
 def get_db():
@@ -65,9 +65,22 @@ def close_db(e):
         db_pool.putconn(db)
 
 def init_db():
-    conn = None
     try:
-        # CONNECT FIRST BEFORE DOING ANYTHING
+        # Safely attempt to add new columns if the table already existed
+        try:
+            cur.execute("ALTER TABLE cases ADD COLUMN staff_uploaded_doc TEXT;")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback() # Column exists, ignore error
+        else:
+            conn.commit()
+
+        # ---> NEW CODE: Add OTP column to users table <---
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN current_otp VARCHAR(10);")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback() 
+        else:
+            conn.commit()
         conn = db_pool.getconn()
         cur = conn.cursor()
         
@@ -97,6 +110,14 @@ def init_db():
                 staff_uploaded_doc TEXT
             );
         """)
+        
+        # Safely attempt to add new columns if the table already existed
+        try:
+            cur.execute("ALTER TABLE cases ADD COLUMN staff_uploaded_doc TEXT;")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback() # Column exists, ignore error
+        else:
+            conn.commit()
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ai_client_logs (
@@ -118,29 +139,15 @@ def init_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-
-        # SAFELY ADD NEW COLUMNS
-        try:
-            cur.execute("ALTER TABLE cases ADD COLUMN staff_uploaded_doc TEXT;")
-            conn.commit()
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback() 
-
-        try:
-            cur.execute("ALTER TABLE users ADD COLUMN current_otp VARCHAR(10);")
-            conn.commit()
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback() 
         
-        # INSERT USERS
         cur.execute("""
             INSERT INTO users (full_name, phone_number, email, role) 
-            VALUES ('Wambui Shadrack', '0711223344', 'shadrackwambui@gmail.com', 'admin') 
+            VALUES ('Wambui Shadrack', '0711223344', 'nduatijosephmwangi@gmail.com', 'admin') 
             ON CONFLICT DO NOTHING;
         """)
         cur.execute("""
             INSERT INTO users (full_name, phone_number, email, role) 
-            VALUES ('Jeff Kangethe', '0796178783', 'nduatijosephmwangi@gmail.com', 'advocate') 
+            VALUES ('Jeff Kangethe', '0796178783', 'jeff@globallaga.com', 'advocate') 
             ON CONFLICT DO NOTHING;
         """)
         cur.execute("""
@@ -151,12 +158,10 @@ def init_db():
         
         conn.commit()
         cur.close()
-        print("💾 [DATABASE INITIALIZATION] Schema verified and updated.")
+        db_pool.putconn(conn)
+        print("💾 [DATABASE INITIALIZATION] Connection Pool active. Schema verified.")
     except Exception as e:
-        print(f"⚠️ [DATABASE INITIALIZATION FAILURE]: {str(e)}")
-    finally:
-        if conn:
-            db_pool.putconn(conn)
+        print(f"⚠️ [DATABASE INITIALIZATION FAILURE] Couldn't map setup attributes: {str(e)}")
 
 # =========================================================
 # 📧 EMAIL NOTIFICATION HELPER
@@ -166,6 +171,7 @@ def send_firm_email(subject, html_content, to_email=FIRM_EMAIL):
     """Secure background email dispatcher using Resend."""
     try:
         resend.Emails.send({
+            # Note: If domain is not verified, use "onboarding@resend.dev"
             "from": "onboarding@resend.dev", 
             "to": to_email,
             "subject": subject,
@@ -243,7 +249,7 @@ def initiate_staff_login(credential):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         if '@' in credential:
-            cur.execute("SELECT full_name, email, role FROM users WHERE email = %s", (credential,))
+            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE email = %s", (credential,))
         else:
             cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE phone_number = %s", (credential,))
             
@@ -255,7 +261,7 @@ def initiate_staff_login(credential):
         otp = str(random.randint(100000, 999999))
         identifier = account['email'] or account['phone_number']
         
-        # Save OTP to the PostgreSQL database
+        # ---> NEW CODE: Save OTP to the PostgreSQL database, not SYSTEM_STATE <---
         cur.execute("UPDATE users SET current_otp = %s WHERE email = %s OR phone_number = %s", (otp, identifier, identifier))
         conn.commit()
         
@@ -281,34 +287,21 @@ def initiate_staff_login(credential):
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def verify_otp():
     data = request.get_json() or {}
-    identifier = str(data.get('identifier', '')).strip()
-    code = str(data.get('code', '')).strip()
+    identifier = data.get('identifier', '').strip()
+    code = data.get('code', '').strip()
     
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
+        # ---> NEW CODE: Check the database for the OTP <---
         cur.execute("SELECT full_name, role, current_otp FROM users WHERE email = %s OR phone_number = %s", (identifier, identifier))
         account = cur.fetchone()
         
-        # Fetch the account
-        cur.execute("SELECT * FROM users WHERE email = %s OR phone_number = %s", (identifier, identifier))
-        account = cur.fetchone()
-
-        if not account:
-            # Add this print to your logs
-            print(f"DEBUG: Search failed for identifier: '{identifier}'")
-            return jsonify({
-                "success": False, 
-                "message": f"User with identifier '{identifier}' not found in the database."
-            }), 404
-            
-        stored_otp = str(account.get('current_otp', '')).strip()
+        if not account or account['current_otp'] != code:
+            return jsonify({"success": False, "message": "Invalid or expired verification token signature."}), 401
         
-        if stored_otp == "" or stored_otp == "None" or stored_otp != code:
-            return jsonify({"success": False, "message": "Invalid or expired verification otp signature."}), 401
-        
-        # Clear the OTP after successful login
+        # Clear the OTP after successful login for security
         cur.execute("UPDATE users SET current_otp = NULL WHERE email = %s OR phone_number = %s", (identifier, identifier))
         conn.commit()
         
@@ -320,20 +313,16 @@ def verify_otp():
         })
     except Exception as e:
         return jsonify({"success": False, "message": f"Database verification error: {str(e)}"}), 500
-
 def client_login(case_number):
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
-        clean_case = str(case_number).strip()
-        
-        # Removed the strict 'Active' check to ensure cases are found
         cur.execute("""
             SELECT case_id, case_number, case_parties, client_name, ai_access_granted, next_court_date, coming_up_for, total_balance, paid_balance, staff_uploaded_doc
             FROM cases 
-            WHERE case_number ILIKE %s
-        """, (f"%{clean_case}%",))
+            WHERE case_number ILIKE %s AND status = 'Active'
+        """, (f"%{case_number}%",))
         case = cur.fetchone()
         
         if not case:
@@ -391,7 +380,7 @@ def ai_consult():
         simulated_response = f"⚖️ [Staff Legal Research AI - Constitution 2010]: Processing operational guidance for query: '{question}'."
         return jsonify({"success": True, "engine": "Staff Legal Research AI", "answer": simulated_response})
         
-    # Client AI Access
+    # Client AI Access (Now completely free and separate from Predictor)
     if case_number:
         try:
             conn = get_db()
@@ -410,6 +399,7 @@ def ai_consult():
             """, (case_number, case_record['client_name'], question, simulated_response))
             conn.commit()
             
+            # Real Email Notification to Staff via Resend
             email_body = f"<h3>Client AI Query Alert</h3><p><strong>Matter:</strong> {case_number} ({case_record['client_name']})</p><p><strong>Question Asked:</strong> {question}</p>"
             send_firm_email(f"AI Query Log: Case {case_number}", email_body)
             
@@ -473,6 +463,7 @@ def document_upload():
     
     log_audit(f"Client Document Uploaded: {secure_name}", uploader, case_number)
     
+    # Notify Staff via Email
     send_firm_email(f"Document Upload: {case_number}", f"<p>A new document (<b>{secure_name}</b>) has been uploaded by the client for matter {case_number}.</p>")
     
     return jsonify({"success": True, "message": "Document uploaded securely to Cloud Vault."})
@@ -515,6 +506,7 @@ def get_dashboard_reminders():
         cur.execute("SELECT case_number, client_name, next_court_date FROM cases WHERE status='Active' LIMIT 3") 
         upcoming = cur.fetchall()
         
+        # Real Email Notification via Resend
         if upcoming:
             html_list = "".join([f"<li><b>{c['case_number']}</b> ({c['client_name']}) - {c['next_court_date']}</li>" for c in upcoming])
             send_firm_email("7-Day Court Matter Reminders", f"<h3>Upcoming Matters This Week:</h3><ul>{html_list}</ul>")
@@ -536,6 +528,7 @@ def search_cases():
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
+        # Validate if the user is the Admin by checking DB role directly, eliminating name-mismatch bugs
         cur.execute("SELECT role FROM users WHERE full_name = %s", (user_name,))
         role_record = cur.fetchone()
         is_admin = role_record and role_record['role'] == 'admin'
@@ -543,14 +536,14 @@ def search_cases():
         if not query:
             cur.execute("""
                 SELECT case_id, case_number, case_parties, client_name, total_balance, paid_balance, next_court_date, coming_up_for 
-                FROM cases ORDER BY case_id DESC LIMIT %s OFFSET %s
+                FROM cases WHERE status = 'Active' ORDER BY case_id DESC LIMIT %s OFFSET %s
             """, (limit, offset))
         else:
             term = f"%{query}%"
             cur.execute("""
                 SELECT case_id, case_number, case_parties, client_name, total_balance, paid_balance, next_court_date, coming_up_for 
                 FROM cases 
-                WHERE (case_number ILIKE %s OR client_name ILIKE %s OR case_parties ILIKE %s)
+                WHERE status = 'Active' AND (case_number ILIKE %s OR client_name ILIKE %s OR case_parties ILIKE %s)
                 ORDER BY case_id DESC LIMIT %s OFFSET %s
             """, (term, term, term, limit, offset))
             
@@ -636,6 +629,5 @@ def toggle_kill_switch():
         return jsonify({"success": True, "status": "ACTIVE", "message": "✅ Core frameworks fully online."})
 
 if __name__ == '__main__':
-    with app.app_context():
-        init_db()
+    init_db()
     app.run(host='0.0.0.0', port=5000, debug=True)
