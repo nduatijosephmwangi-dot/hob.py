@@ -243,7 +243,7 @@ def initiate_staff_login(credential):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         if '@' in credential:
-            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE email = %s", (credential,))
+            cur.execute("SELECT full_name, email, role FROM users WHERE email = %s", (credential,))
         else:
             cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE phone_number = %s", (credential,))
             
