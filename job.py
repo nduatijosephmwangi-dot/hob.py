@@ -291,9 +291,17 @@ def verify_otp():
         cur.execute("SELECT full_name, role, current_otp FROM users WHERE email = %s OR phone_number = %s", (identifier, identifier))
         account = cur.fetchone()
         
-        # Ensure account exists and grab the stored OTP safely
+        # Fetch the account
+        cur.execute("SELECT * FROM users WHERE email = %s OR phone_number = %s", (identifier, identifier))
+        account = cur.fetchone()
+
         if not account:
-            return jsonify({"success": False, "message": "User not found."}), 404
+            # Add this print to your logs
+            print(f"DEBUG: Search failed for identifier: '{identifier}'")
+            return jsonify({
+                "success": False, 
+                "message": f"User with identifier '{identifier}' not found in the database."
+            }), 404
             
         stored_otp = str(account.get('current_otp', '')).strip()
         
