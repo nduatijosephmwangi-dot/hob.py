@@ -135,12 +135,12 @@ def init_db():
         # INSERT USERS
         cur.execute("""
             INSERT INTO users (full_name, phone_number, email, role) 
-            VALUES ('Wambui Shadrack', '0711223344', 'nduatijosephmwangi@gmail.com', 'admin') 
+            VALUES ('Wambui Shadrack', '0711223344', 'shadrackwambui@gmail.com', 'admin') 
             ON CONFLICT DO NOTHING;
         """)
         cur.execute("""
             INSERT INTO users (full_name, phone_number, email, role) 
-            VALUES ('Jeff Kangethe', '0796178783', 'jeff@globallaga.com', 'advocate') 
+            VALUES ('Jeff Kangethe', '0796178783', 'nduatijosephmwangi@gmail.com', 'advocate') 
             ON CONFLICT DO NOTHING;
         """)
         cur.execute("""
