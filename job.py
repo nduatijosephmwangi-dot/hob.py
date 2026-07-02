@@ -7,6 +7,7 @@ from psycopg2 import pool
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import resend
 
@@ -37,8 +38,7 @@ FIRM_EMAIL = "shdrackwambui@gmail.com" # Central firm email for notifications
 
 # In-Memory Security State & Router Store
 SYSTEM_STATE = {
-    "LOCKDOWN_MODE": False,
-    "AUTH_STORE": {}
+    "LOCKDOWN_MODE": False
 }
 
 # =========================================================
@@ -69,9 +69,17 @@ def init_db():
                 full_name VARCHAR(255) NOT NULL,
                 phone_number VARCHAR(50) UNIQUE,
                 email VARCHAR(255) UNIQUE,
-                role VARCHAR(50) NOT NULL
+                role VARCHAR(50) NOT NULL,
+                password_hash VARCHAR(255) NOT NULL
             );
         """)
+
+        # Alter table in case it exists but lacks the password_hash column
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255);")
+            conn.commit()
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback() # Column exists, ignore error
         
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cases (
@@ -93,10 +101,9 @@ def init_db():
         # Safely attempt to add new columns if the table already existed
         try:
             cur.execute("ALTER TABLE cases ADD COLUMN staff_uploaded_doc TEXT;")
+            conn.commit()
         except psycopg2.errors.DuplicateColumn:
             conn.rollback() # Column exists, ignore error
-        else:
-            conn.commit()
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ai_client_logs (
@@ -119,21 +126,24 @@ def init_db():
             );
         """)
         
+        # Generate default password hash for initial user seeds
+        default_pwd_hash = generate_password_hash('password123')
+
         cur.execute("""
-            INSERT INTO users (full_name, phone_number, email, role) 
-            VALUES ('Wambui Shadrack', '0711223344', 'shdrackwambui@gmail.com', 'admin') 
+            INSERT INTO users (full_name, phone_number, email, role, password_hash) 
+            VALUES ('Wambui Shadrack', '0711223344', 'shdrackwambui@gmail.com', 'admin', %s) 
             ON CONFLICT DO NOTHING;
-        """)
+        """, (default_pwd_hash,))
         cur.execute("""
-            INSERT INTO users (full_name, phone_number, email, role) 
-            VALUES ('Jeff Kangethe', '0722334455', 'jeff@globallaga.com', 'advocate') 
+            INSERT INTO users (full_name, phone_number, email, role, password_hash) 
+            VALUES ('Jeff Kangethe', '0722334455', 'jeff@globallaga.com', 'advocate', %s) 
             ON CONFLICT DO NOTHING;
-        """)
+        """, (default_pwd_hash,))
         cur.execute("""
-            INSERT INTO users (full_name, phone_number, email, role) 
-            VALUES ('Jane Onyango', '0733445566', 'jane@globallaga.com', 'secretary') 
+            INSERT INTO users (full_name, phone_number, email, role, password_hash) 
+            VALUES ('Jane Onyango', '0733445566', 'jane@globallaga.com', 'secretary', %s) 
             ON CONFLICT DO NOTHING;
-        """)
+        """, (default_pwd_hash,))
         
         conn.commit()
         cur.close()
@@ -169,7 +179,7 @@ def cyber_security_check():
         logging.info(f"API HIT: {request.remote_addr} accessed {request.endpoint}")
 
     if SYSTEM_STATE["LOCKDOWN_MODE"]:
-        allowed_routes = ['login_router', 'verify_password', 'toggle_kill_switch']
+        allowed_routes = ['login_router', 'toggle_kill_switch']
         if request.endpoint not in allowed_routes:
             logging.warning(f"BLOCKED REQUEST: Unauthorized access attempt to '{request.endpoint}'.")
             return jsonify({
@@ -211,71 +221,50 @@ def get_system_logs():
 def login_router():
     payload = request.get_json() or {}
     credential = payload.get('credential', '').strip()
+    password = payload.get('password', '').strip()
     
     if not credential:
         return jsonify({"success": False, "message": "Login field cannot be blank."}), 400
         
+    # Checking for staff patterns (email) or phone numbers
     if '@' in credential or (credential.isdigit() and len(credential) >= 10):
-        return initiate_staff_login(credential)
+        return staff_login(credential, password)
     else:
         return client_login(credential)
 
-def initiate_staff_login(credential):
+def staff_login(credential, password):
+    if not password:
+        return jsonify({"success": False, "message": "Password is required for staff login."}), 400
+        
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         if '@' in credential:
-            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE email = %s", (credential,))
+            cur.execute("SELECT full_name, phone_number, email, role, password_hash FROM users WHERE email = %s", (credential,))
         else:
-            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE phone_number = %s", (credential,))
+            cur.execute("SELECT full_name, phone_number, email, role, password_hash FROM users WHERE phone_number = %s", (credential,))
             
         account = cur.fetchone()
         
         if not account:
             return jsonify({"success": False, "message": "Access Denied: Credential is not registered as active staff."}), 403
         
-        # Generate the secure backend password string
-        generated_password = str(random.randint(100000, 999999))
-        identifier = account['email'] or account['phone_number']
-        SYSTEM_STATE["AUTH_STORE"][identifier] = {"code": generated_password, "user": account}
+        # Verify Password
+        if not check_password_hash(account['password_hash'], password):
+            return jsonify({"success": False, "message": "Access Denied: Invalid password."}), 401
+            
+        logging.info(f"Staff login successful: {credential}")
         
-        # Clean terminal logging for standard local debug output
-        print(f"\n📡 [SECURITY UTILITY LOG] Generated Password for {account['full_name']} ({account['role']}) -> {generated_password}\n")
-        logging.info(f"Backend password generated successfully for staff identifier: {identifier}")
-        
-        # Explicitly pass down 'role' and change mode to 'password_required'
         return jsonify({
             "success": True, 
-            "mode": "password_required", 
-            "role": account['role'], 
-            "identifier": identifier, 
-            "message": "Staff signature validated. Enter system-generated access key."
+            "mode": "staff_dashboard",
+            "role": account['role'],
+            "user_name": account['full_name'],
+            "message": "Login successful."
         })
     except Exception as e:
         return jsonify({"success": False, "message": f"Server Authentication Fault: {str(e)}"}), 500
-
-@app.route('/api/auth/verify-password', methods=['POST'])
-def verify_password():
-    data = request.get_json() or {}
-    identifier = data.get('identifier', '').strip()
-    password = data.get('password', '').strip()
-    
-    record = SYSTEM_STATE["AUTH_STORE"].get(identifier)
-    if not record or record['code'] != password:
-        logging.warning(f"FAILED LOGIN ATTEMPT: Invalid password entry signature for {identifier}")
-        return jsonify({"success": False, "message": "Invalid or expired access password signature."}), 401
-    
-    # Destructure entry to prevent reuse attacks
-    SYSTEM_STATE["AUTH_STORE"].pop(identifier, None)
-    logging.info(f"SUCCESSFUL LOGIN: {record['user']['full_name']} signed in via backend security gateway.")
-    
-    return jsonify({
-        "success": True,
-        "role": record['user']['role'], 
-        "user_name": record['user']['full_name'],    
-        "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
-    })
 
 def client_login(case_number):
     try:
@@ -492,7 +481,6 @@ def search_cases():
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
-        # Validate if the user is the Admin by checking DB role directly, eliminating name-mismatch bugs
         cur.execute("SELECT role FROM users WHERE full_name = %s", (user_name,))
         role_record = cur.fetchone()
         is_admin = role_record and role_record['role'] == 'admin'
