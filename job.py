@@ -54,8 +54,26 @@ SYSTEM_STATE = {
 db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, app.config['DATABASE_URL'])
 
 def get_db():
+    """ 
+    Safely retrieves a database connection.
+    Includes retry logic to fix the "SSL connection has been closed" error
+    caused by the serverless DB dropping idle connections.
+    """
     if 'db' not in g:
-        g.db = db_pool.getconn()
+        for attempt in range(3):
+            try:
+                conn = db_pool.getconn()
+                # Ping the database to ensure the SSL connection is still alive
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                g.db = conn
+                break
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                # The connection dropped; remove it and try again
+                db_pool.putconn(conn, close=True)
+                if attempt == 2:
+                    logging.error(f"Database connection failed after 3 attempts: {str(e)}")
+                    raise e
     return g.db
 
 @app.teardown_appcontext
@@ -66,21 +84,6 @@ def close_db(e):
 
 def init_db():
     try:
-        # Safely attempt to add new columns if the table already existed
-        try:
-            cur.execute("ALTER TABLE cases ADD COLUMN staff_uploaded_doc TEXT;")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback() # Column exists, ignore error
-        else:
-            conn.commit()
-
-        # ---> NEW CODE: Add OTP column to users table <---
-        try:
-            cur.execute("ALTER TABLE users ADD COLUMN current_otp VARCHAR(10);")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback() 
-        else:
-            conn.commit()
         conn = db_pool.getconn()
         cur = conn.cursor()
         
@@ -116,6 +119,13 @@ def init_db():
             cur.execute("ALTER TABLE cases ADD COLUMN staff_uploaded_doc TEXT;")
         except psycopg2.errors.DuplicateColumn:
             conn.rollback() # Column exists, ignore error
+        else:
+            conn.commit()
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN current_otp VARCHAR(10);")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback() 
         else:
             conn.commit()
 
@@ -171,7 +181,6 @@ def send_firm_email(subject, html_content, to_email=FIRM_EMAIL):
     """Secure background email dispatcher using Resend."""
     try:
         resend.Emails.send({
-            # Note: If domain is not verified, use "onboarding@resend.dev"
             "from": "onboarding@resend.dev", 
             "to": to_email,
             "subject": subject,
@@ -248,21 +257,27 @@ def initiate_staff_login(credential):
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
-        if '@' in credential:
-            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE email = %s", (credential,))
+        identifier = credential.lower()
+        
+        if '@' in identifier:
+            # Added LOWER() to prevent 404 Case Sensitivity issues
+            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE LOWER(email) = %s", (identifier,))
         else:
             cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE phone_number = %s", (credential,))
             
         account = cur.fetchone()
         
         if not account:
-            return jsonify({"success": False, "message": "Access Denied: Credential is not registered as active staff."}), 403
+            return jsonify({"success": False, "message": "Access Denied: Credential is not registered as active staff."}), 404
         
         otp = str(random.randint(100000, 999999))
-        identifier = account['email'] or account['phone_number']
         
-        # ---> NEW CODE: Save OTP to the PostgreSQL database, not SYSTEM_STATE <---
-        cur.execute("UPDATE users SET current_otp = %s WHERE email = %s OR phone_number = %s", (otp, identifier, identifier))
+        # Save OTP to the PostgreSQL database securely
+        if '@' in identifier:
+            cur.execute("UPDATE users SET current_otp = %s WHERE LOWER(email) = %s", (otp, identifier))
+        else:
+            cur.execute("UPDATE users SET current_otp = %s WHERE phone_number = %s", (otp, credential))
+            
         conn.commit()
         
         print(f"\n📡 [SMS/EMAIL UTILITY LOG] Token Dispatch for {account['full_name']} -> {otp}\n")
@@ -280,29 +295,30 @@ def initiate_staff_login(credential):
             """
             send_firm_email("Your Secure Portal OTP", email_html, to_email=account['email'])
         
-        return jsonify({"success": True, "mode": "otp_required", "identifier": identifier, "message": "Verification code dispatched securely."})
+        return jsonify({"success": True, "mode": "otp_required", "identifier": credential, "message": "Verification code dispatched securely."})
     except Exception as e:
         return jsonify({"success": False, "message": f"Server Authentication Fault: {str(e)}"}), 500
 
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def verify_otp():
     data = request.get_json() or {}
-    identifier = data.get('identifier', '').strip()
+    identifier = data.get('identifier', '').strip().lower()
     code = data.get('code', '').strip()
     
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
-        # ---> NEW CODE: Check the database for the OTP <---
-        cur.execute("SELECT full_name, role, current_otp FROM users WHERE email = %s OR phone_number = %s", (identifier, identifier))
+        # Search safely using LOWER() to guarantee a match
+        cur.execute("SELECT full_name, role, current_otp FROM users WHERE LOWER(email) = %s OR phone_number = %s", (identifier, data.get('identifier', '').strip()))
         account = cur.fetchone()
         
-        if not account or account['current_otp'] != code:
-            return jsonify({"success": False, "message": "Invalid or expired verification token signature."}), 401
+        # Strictly compare strings to avoid Invalid Token Signature errors
+        if not account or str(account['current_otp']) != str(code):
+            return jsonify({"success": False, "message": "Invalid verification token signature."}), 401
         
         # Clear the OTP after successful login for security
-        cur.execute("UPDATE users SET current_otp = NULL WHERE email = %s OR phone_number = %s", (identifier, identifier))
+        cur.execute("UPDATE users SET current_otp = NULL WHERE LOWER(email) = %s OR phone_number = %s", (identifier, data.get('identifier', '').strip()))
         conn.commit()
         
         return jsonify({
@@ -313,6 +329,7 @@ def verify_otp():
         })
     except Exception as e:
         return jsonify({"success": False, "message": f"Database verification error: {str(e)}"}), 500
+
 def client_login(case_number):
     try:
         conn = get_db()
