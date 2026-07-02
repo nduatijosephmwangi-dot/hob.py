@@ -306,7 +306,7 @@ def verify_otp():
         stored_otp = str(account.get('current_otp', '')).strip()
         
         if stored_otp == "" or stored_otp == "None" or stored_otp != code:
-            return jsonify({"success": False, "message": "Invalid or expired verification token signature."}), 401
+            return jsonify({"success": False, "message": "Invalid or expired verification otp signature."}), 401
         
         # Clear the OTP after successful login
         cur.execute("UPDATE users SET current_otp = NULL WHERE email = %s OR phone_number = %s", (identifier, identifier))
