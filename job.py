@@ -136,7 +136,7 @@ def init_db():
         """, (default_pwd_hash,))
         cur.execute("""
             INSERT INTO users (full_name, phone_number, email, role, password_hash) 
-            VALUES ('Jeff Kangethe', '0722334455', 'jeff@globallaga.com', 'advocate', %s) 
+            VALUES ('Jeff Kangethe', '0722334455', 'nduatijsephmwangi@gmail.com', 'advocate', %s) 
             ON CONFLICT DO NOTHING;
         """, (default_pwd_hash,))
         cur.execute("""
@@ -241,9 +241,9 @@ def staff_login(credential, password):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         if '@' in credential:
-            cur.execute("SELECT full_name, phone_number, email, role, password_hash FROM users WHERE email = %s", (credential,))
+            cur.execute("SELECT full_name, phone_number, email, role, password FROM users WHERE email = %s", (credential,))
         else:
-            cur.execute("SELECT full_name, phone_number, email, role, password_hash FROM users WHERE phone_number = %s", (credential,))
+            cur.execute("SELECT full_name, phone_number, email, role, password FROM users WHERE phone_number = %s", (credential,))
             
         account = cur.fetchone()
         
@@ -251,7 +251,7 @@ def staff_login(credential, password):
             return jsonify({"success": False, "message": "Access Denied: Credential is not registered as active staff."}), 403
         
         # Verify Password
-        if not check_password_hash(account['password_hash'], password):
+        if not check_password_hash(account['password'], password):
             return jsonify({"success": False, "message": "Access Denied: Invalid password."}), 401
             
         logging.info(f"Staff login successful: {credential}")
