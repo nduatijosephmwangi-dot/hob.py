@@ -7,7 +7,6 @@ from psycopg2 import pool
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import resend
 
@@ -18,24 +17,11 @@ import resend
 app = Flask(__name__)
 CORS(app)
 
-# ---------------------------------------------------------
-# 🌐 NEON (POSTGRES) CONNECTION
-# ---------------------------------------------------------
-# Set the DATABASE_URL env-var on Render (or your host) to your Neon
-# connection string, e.g.
-#   postgresql://<user>:<password>@<host>.neon.tech/<db>?sslmode=require
-# The fallback below is only used for local dev if the env-var is missing.
-DEFAULT_DB_URL = (
-    "postgresql://neondb_owner:REPLACE_ME@ep-example-pooler.neon.tech/"
-    "neondb?sslmode=require"
-)
-DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_DB_URL)
-
-# Neon requires SSL. If the caller forgot to append it, add it automatically.
-if "sslmode=" not in DATABASE_URL:
-    DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
-
-app.config['DATABASE_URL'] = DATABASE_URL
+# Configured for Neon cloud deployment via environment variables out-of-the-box
+app.config['DATABASE_URL'] = os.environ.get(
+    'DATABASE_URL', 
+    'dbname=postgres user=postgres password=jose1023 host=localhost port=5432'
+)  
 app.config['UPLOAD_FOLDER'] = './client_docs/'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -48,16 +34,11 @@ logging.basicConfig(
 
 # Resend Email Configuration
 resend.api_key = os.environ.get('RESEND_API_KEY', 're_dummy_key_replace_in_production')
-FIRM_EMAIL = "shdrackwambui@gmail.com" # Central firm email for notifications
+FIRM_EMAIL = "shdrackwambui@gmail.com" 
 
-# Default password seeded for staff accounts on first boot. Change per user
-# afterwards. Override with env-var STAFF_DEFAULT_PASSWORD if desired.
-STAFF_DEFAULT_PASSWORD = os.environ.get("STAFF_DEFAULT_PASSWORD", "ChangeMe123!")
-
-# In-Memory Security State & Router Store
+# REFACTORED: OTP store dropped from system global state memory
 SYSTEM_STATE = {
-    "LOCKDOWN_MODE": False,
-    "OTP_STORE": {}
+    "LOCKDOWN_MODE": False
 }
 
 # =========================================================
@@ -82,6 +63,7 @@ def init_db():
         conn = db_pool.getconn()
         cur = conn.cursor()
         
+        # REFACTORED: Added structural password attribute directly to schema profile
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id SERIAL PRIMARY KEY,
@@ -89,16 +71,9 @@ def init_db():
                 phone_number VARCHAR(50) UNIQUE,
                 email VARCHAR(255) UNIQUE,
                 role VARCHAR(50) NOT NULL,
-                password_hash TEXT
+                password VARCHAR(255)
             );
         """)
-
-        # Add password_hash if the users table already existed without it
-        try:
-            cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT;")
-            conn.commit()
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback()
         
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cases (
@@ -117,13 +92,22 @@ def init_db():
             );
         """)
         
-        # Safely attempt to add new columns if the table already existed
+        # Safely attempt to add columns if tables already existed on Neon instance
         try:
             cur.execute("ALTER TABLE cases ADD COLUMN staff_uploaded_doc TEXT;")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback() # Column exists, ignore error
-        else:
             conn.commit()
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+        except Exception:
+            conn.rollback()
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN password VARCHAR(255);")
+            conn.commit()
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+        except Exception:
+            conn.rollback()
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ai_client_logs (
@@ -145,26 +129,33 @@ def init_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        
+        # REFACTORED: Seed system staff profiles containing explicit access passwords
+        cur.execute("""
+            INSERT INTO users (full_name, phone_number, email, role, password) 
+            VALUES ('Wambui Shadrack', '0711223344', 'shdrackwambui@gmail.com', 'admin', 'admin123') 
+            ON CONFLICT (email) DO NOTHING;
+        """)
+        cur.execute("""
+            INSERT INTO users (full_name, phone_number, email, role, password) 
+            VALUES ('Jeff Kangethe', '0722334455', 'jeff@globallaga.com', 'advocate', 'jeff123') 
+            ON CONFLICT (email) DO NOTHING;
+        """)
+        cur.execute("""
+            INSERT INTO users (full_name, phone_number, email, role, password) 
+            VALUES ('Jane Onyango', '0733445566', 'jane@globallaga.com', 'secretary', 'jane123') 
+            ON CONFLICT (email) DO NOTHING;
+        """)
 
-        # ----- Seed staff accounts with hashed default password -----
-        default_hash = generate_password_hash(STAFF_DEFAULT_PASSWORD)
-        seed_staff = [
-            ('Wambui Shadrack', '0711223344', 'shdrackwambui@gmail.com', 'admin'),
-            ('Jeff Kangethe',   '0722334455', 'jeff@globallaga.com',     'advocate'),
-            ('Jane Onyango',    '0733445566', 'jane@globallaga.com',     'secretary'),
-        ]
-        for full_name, phone, email, role in seed_staff:
-            cur.execute("""
-                INSERT INTO users (full_name, phone_number, email, role, password_hash)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (email) DO UPDATE
-                    SET password_hash = COALESCE(users.password_hash, EXCLUDED.password_hash);
-            """, (full_name, phone, email, role, default_hash))
+        # Fallback enforcement updates if records pre-existed without passwords
+        cur.execute("UPDATE users SET password = 'admin123' WHERE email = 'shdrackwambui@gmail.com' AND password IS NULL;")
+        cur.execute("UPDATE users SET password = 'jeff123' WHERE email = 'jeff@globallaga.com' AND password IS NULL;")
+        cur.execute("UPDATE users SET password = 'jane123' WHERE email = 'jane@globallaga.com' AND password IS NULL;")
         
         conn.commit()
         cur.close()
         db_pool.putconn(conn)
-        print("💾 [DATABASE INITIALIZATION] Neon connection pool active. Schema verified.")
+        print("💾 [DATABASE INITIALIZATION] Connection Pool active. Schema verified.")
     except Exception as e:
         print(f"⚠️ [DATABASE INITIALIZATION FAILURE] Couldn't map setup attributes: {str(e)}")
 
@@ -173,10 +164,9 @@ def init_db():
 # =========================================================
 
 def send_firm_email(subject, html_content):
-    """Secure background email dispatcher using Resend."""
     try:
         resend.Emails.send({
-            "from": "notifications@globallaga.com", # Update with your verified Resend domain
+            "from": "notifications@globallaga.com", 
             "to": FIRM_EMAIL,
             "subject": subject,
             "html": html_content
@@ -195,7 +185,8 @@ def cyber_security_check():
         logging.info(f"API HIT: {request.remote_addr} accessed {request.endpoint}")
 
     if SYSTEM_STATE["LOCKDOWN_MODE"]:
-        allowed_routes = ['login_router', 'verify_otp', 'staff_password_login', 'toggle_kill_switch']
+        # REFACTORED: Safe endpoints during lockdown point to verify_password instead of verify_otp
+        allowed_routes = ['login_router', 'verify_password', 'toggle_kill_switch']
         if request.endpoint not in allowed_routes:
             logging.warning(f"BLOCKED REQUEST: Unauthorized access attempt to '{request.endpoint}'.")
             return jsonify({
@@ -237,103 +228,72 @@ def get_system_logs():
 def login_router():
     payload = request.get_json() or {}
     credential = payload.get('credential', '').strip()
-    password   = payload.get('password', '')
     
     if not credential:
         return jsonify({"success": False, "message": "Login field cannot be blank."}), 400
         
-    # Staff = email address (password required)
-    if '@' in credential:
-        if not password:
-            return jsonify({"success": False, "mode": "password_required",
-                            "message": "Password required for staff login."}), 200
-        return staff_password_login_inner(credential, password)
-
-    # Phone number staff login keeps the OTP flow (legacy)
-    if credential.isdigit() and len(credential) >= 10:
+    if '@' in credential or (credential.isdigit() and len(credential) >= 10):
         return initiate_staff_login(credential)
+    else:
+        return client_login(credential)
 
-    # Everything else is treated as a client case number
-    return client_login(credential)
-
+# REFACTORED: Removed OTP random creation entirely; prompts UI to collect user passwords instead
 def initiate_staff_login(credential):
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE phone_number = %s", (credential,))
+        
+        if '@' in credential:
+            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE email = %s", (credential,))
+        else:
+            cur.execute("SELECT full_name, phone_number, email, role FROM users WHERE phone_number = %s", (credential,))
+            
         account = cur.fetchone()
         
         if not account:
             return jsonify({"success": False, "message": "Access Denied: Credential is not registered as active staff."}), 403
         
-        otp = str(random.randint(100000, 999999))
         identifier = account['email'] or account['phone_number']
-        SYSTEM_STATE["OTP_STORE"][identifier] = {"code": otp, "user": account}
+        logging.info(f"Staff identity match for {identifier}. Requiring password credentials.")
         
-        print(f"\n📡 [SMS/EMAIL UTILITY LOG] Token Dispatch for {account['full_name']} -> {otp}\n")
-        logging.info(f"OTP generated successfully for staff: {identifier}")
-        
-        return jsonify({"success": True, "mode": "otp_required", "identifier": identifier, "message": "Verification code dispatched securely."})
+        return jsonify({"success": True, "mode": "password_required", "identifier": identifier})
     except Exception as e:
         return jsonify({"success": False, "message": f"Server Authentication Fault: {str(e)}"}), 500
 
-# ---------------------------------------------------------
-# NEW: Email + Password login for staff (backed by Neon DB)
-# ---------------------------------------------------------
-@app.route('/api/auth/staff-login', methods=['POST'])
-def staff_password_login():
+# REFACTORED: Completely replaced route handler from verify-otp to database verify-password
+@app.route('/api/auth/verify-password', methods=['POST'])
+def verify_password():
     data = request.get_json() or {}
-    email    = data.get('email', '').strip().lower()
-    password = data.get('password', '')
-    if not email or not password:
-        return jsonify({"success": False, "message": "Email and password are required."}), 400
-    return staff_password_login_inner(email, password)
-
-def staff_password_login_inner(email, password):
+    identifier = data.get('identifier', '').strip()
+    password = data.get('password', '').strip()
+    
+    if not identifier or not password:
+        return jsonify({"success": False, "message": "Missing credentials profile metadata context."}), 400
+        
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT full_name, email, role, password_hash
-              FROM users
-             WHERE LOWER(email) = LOWER(%s)
-        """, (email,))
+        
+        if '@' in identifier:
+            cur.execute("SELECT full_name, role, password FROM users WHERE email = %s", (identifier,))
+        else:
+            cur.execute("SELECT full_name, role, password FROM users WHERE phone_number = %s", (identifier,))
+            
         account = cur.fetchone()
-
-        if not account or not account.get('password_hash') \
-                or not check_password_hash(account['password_hash'], password):
-            logging.warning(f"Failed staff password login for {email}")
-            return jsonify({"success": False, "message": "Invalid email or password."}), 401
-
-        log_audit("Staff password login", account['full_name'], account['email'])
+        
+        if not account or account['password'] != password:
+            logging.warning(f"FAILED LOGIN: Illegal password access handshake attempt on profile context: {identifier}")
+            return jsonify({"success": False, "message": "Access Denied: Invalid password matching system signature record."}), 401
+        
+        logging.info(f"AUTHENTICATED: Staff member {account['full_name']} logged in safely.")
         return jsonify({
             "success": True,
-            "mode": "staff_dashboard",
-            "role": account['role'],
-            "user_name": account['full_name'],
+            "role": account['role'], 
+            "user_name": account['full_name'],    
             "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
         })
     except Exception as e:
-        return jsonify({"success": False, "message": f"Server Authentication Fault: {str(e)}"}), 500
-
-@app.route('/api/auth/verify-otp', methods=['POST'])
-def verify_otp():
-    data = request.get_json() or {}
-    identifier = data.get('identifier', '').strip()
-    code = data.get('code', '').strip()
-    
-    record = SYSTEM_STATE["OTP_STORE"].get(identifier)
-    if not record or record['code'] != code:
-        return jsonify({"success": False, "message": "Invalid or expired verification token signature."}), 401
-    
-    SYSTEM_STATE["OTP_STORE"].pop(identifier, None)
-    
-    return jsonify({
-        "success": True,
-        "role": record['user']['role'], 
-        "user_name": record['user']['full_name'],    
-        "lockdown_status": SYSTEM_STATE["LOCKDOWN_MODE"]
-    })
+        return jsonify({"success": False, "message": f"Authentication Engine Failure: {str(e)}"}), 500
 
 def client_login(case_number):
     try:
@@ -397,12 +357,10 @@ def ai_consult():
     if not question:
         return jsonify({"success": False, "message": "Question context cannot be blank."}), 400
         
-    # Staff / Admin AI Access
     if user_name:
         simulated_response = f"⚖️ [Staff Legal Research AI - Constitution 2010]: Processing operational guidance for query: '{question}'."
         return jsonify({"success": True, "engine": "Staff Legal Research AI", "answer": simulated_response})
         
-    # Client AI Access (Now completely free and separate from Predictor)
     if case_number:
         try:
             conn = get_db()
@@ -421,7 +379,6 @@ def ai_consult():
             """, (case_number, case_record['client_name'], question, simulated_response))
             conn.commit()
             
-            # Real Email Notification to Staff via Resend
             email_body = f"<h3>Client AI Query Alert</h3><p><strong>Matter:</strong> {case_number} ({case_record['client_name']})</p><p><strong>Question Asked:</strong> {question}</p>"
             send_firm_email(f"AI Query Log: Case {case_number}", email_body)
             
@@ -471,7 +428,6 @@ def process_payment():
 
 @app.route('/api/documents/upload', methods=['POST'])
 def document_upload():
-    """Client uploading documents to the firm."""
     case_number = request.form.get('case_number', 'General Case context')
     uploader = request.form.get('uploader_name', 'Client')
     
@@ -484,15 +440,12 @@ def document_upload():
     file.save(absolute_path)
     
     log_audit(f"Client Document Uploaded: {secure_name}", uploader, case_number)
-    
-    # Notify Staff via Email
     send_firm_email(f"Document Upload: {case_number}", f"<p>A new document (<b>{secure_name}</b>) has been uploaded by the client for matter {case_number}.</p>")
     
     return jsonify({"success": True, "message": "Document uploaded securely to Cloud Vault."})
 
 @app.route('/api/staff/upload-document', methods=['POST'])
 def staff_document_upload():
-    """Staff uploading documents directly to the client's portal."""
     case_number = request.form.get('case_number')
     user_name = request.form.get('user_name', 'Staff')
     
@@ -524,11 +477,9 @@ def get_dashboard_reminders():
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
-        target_date_str = (datetime.now() + timedelta(days=7)).strftime("%dth %B %Y")
         cur.execute("SELECT case_number, client_name, next_court_date FROM cases WHERE status='Active' LIMIT 3") 
         upcoming = cur.fetchall()
         
-        # Real Email Notification via Resend
         if upcoming:
             html_list = "".join([f"<li><b>{c['case_number']}</b> ({c['client_name']}) - {c['next_court_date']}</li>" for c in upcoming])
             send_firm_email("7-Day Court Matter Reminders", f"<h3>Upcoming Matters This Week:</h3><ul>{html_list}</ul>")
@@ -550,7 +501,6 @@ def search_cases():
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
-        # Validate if the user is the Admin by checking DB role directly, eliminating name-mismatch bugs
         cur.execute("SELECT role FROM users WHERE full_name = %s", (user_name,))
         role_record = cur.fetchone()
         is_admin = role_record and role_record['role'] == 'admin'
@@ -652,4 +602,4 @@ def toggle_kill_switch():
 
 if __name__ == '__main__':
     init_db()
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False)
+    app.run(host='0.0.0.0', port=5000, debug=True)
